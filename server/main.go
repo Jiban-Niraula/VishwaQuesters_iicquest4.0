@@ -91,7 +91,7 @@ func main() {
 	// ──── Public Routes ────
 	r.POST("/api/register", handlers.Register(db))
 	r.POST("/api/login", handlers.Login(db))
-	r.GET("/api/events/:code", handlers.GetPublicEvent(db))
+	r.GET("/api/events/code/:code", handlers.GetPublicEvent(db))
 
 	// ──── Authenticated Routes ────
 	api := r.Group("/api")
