@@ -6,8 +6,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// ──────────────── USER ────────────────
-
 type User struct {
 	ID           uint   `gorm:"primaryKey" json:"id"`
 	Email        string `gorm:"uniqueIndex;not null" json:"email"`
@@ -27,8 +25,6 @@ type User struct {
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
-// ──────────────── WALLET ────────────────
-
 type Wallet struct {
 	ID     uint  `gorm:"primaryKey" json:"id"`
 	UserID uint  `gorm:"uniqueIndex;not null" json:"userId"`
@@ -43,24 +39,20 @@ type Wallet struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// ──────────────── TRANSACTION ────────────────
-
 type Transaction struct {
 	ID       uint    `gorm:"primaryKey" json:"id"`
 	WalletID uint    `gorm:"index;not null" json:"walletId"`
 	Wallet   *Wallet `gorm:"foreignKey:WalletID" json:"-"`
 
-	Type        string  `gorm:"not null" json:"type"` // deposit | charge | credit | commission | subscription
+	Type        string  `gorm:"not null" json:"type"` // deposit | charge | credit | commission | subscription | refund
 	Amount      float64 `gorm:"not null" json:"amount"`
 	Description string  `gorm:"type:text" json:"description"`
 
-	ReferenceType string `json:"referenceType,omitempty"` // Ad | AdPlacement | Subscription
+	ReferenceType string `json:"referenceType,omitempty"`
 	ReferenceID   uint   `json:"referenceId,omitempty"`
 
 	CreatedAt time.Time `json:"createdAt"`
 }
-
-// ──────────────── SUBSCRIPTION ────────────────
 
 type Subscription struct {
 	ID     uint  `gorm:"primaryKey" json:"id"`
@@ -77,12 +69,10 @@ type Subscription struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// ──────────────── EVENT ────────────────
-
 type Event struct {
 	ID        uint  `gorm:"primaryKey" json:"id"`
 	CreatorID uint  `gorm:"index;not null" json:"creatorId"`
-	Creator   *User `gorm:"foreignKey:CreatorID" json:"-"`
+	Creator   *User `gorm:"foreignKey:CreatorID" json:"creator,omitempty"`
 
 	Title       string `gorm:"not null" json:"title"`
 	Description string `gorm:"type:text" json:"description,omitempty"`
@@ -99,23 +89,19 @@ type Event struct {
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
-// ──────────────── STREAM DESTINATION ────────────────
-
 type StreamDestination struct {
 	ID      uint   `gorm:"primaryKey" json:"id"`
 	EventID uint   `gorm:"index;not null" json:"eventId"`
-	Event   *Event `gorm:"foreignKey:EventID" json:"-"`
+	Event   *Event `gorm:"foreignKey:EventID" json:"event,omitempty"`
 
 	Platform  string `gorm:"not null" json:"platform"`
-	StreamKey string `gorm:"not null" json:"streamKey"`
+	StreamKey string `gorm:"not null" json:"-"`
 	ServerURL string `gorm:"not null" json:"serverUrl"`
 	IsActive  bool   `gorm:"default:false" json:"isActive"`
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
-
-// ──────────────── AD ────────────────
 
 type Ad struct {
 	ID        uint  `gorm:"primaryKey" json:"id"`
@@ -125,15 +111,20 @@ type Ad struct {
 	Title           string `gorm:"not null" json:"title"`
 	Type            string `gorm:"not null" json:"type"` // image | video
 	MediaURL        string `gorm:"not null" json:"mediaUrl"`
-	DurationSeconds int    `gorm:"default:0" json:"durationSeconds"` // 0 for image
+	DurationSeconds int    `gorm:"default:0" json:"durationSeconds"`
 	ThumbnailURL    string `json:"thumbnailUrl,omitempty"`
 
-	Status string `gorm:"not null;default:'pending'" json:"status"` // pending | approved | rejected
+	Status string `gorm:"not null;default:'pending'" json:"status"` // pending | approved | rejected | completed
 
+	BaseChargePerPlay float64 `gorm:"not null;default:0" json:"baseChargePerPlay"`
 	ChargeAmount      float64 `gorm:"not null;default:0" json:"chargeAmount"`
 	AdminCommission   float64 `gorm:"not null;default:0" json:"adminCommission"`
 	CreatorPayoutPro  float64 `gorm:"not null;default:0" json:"creatorPayoutPro"`
 	CreatorPayoutFree float64 `gorm:"not null;default:0" json:"creatorPayoutFree"`
+
+	MaxPlays        int     `gorm:"not null;default:1" json:"maxPlays"`
+	CompletedPlays  int     `gorm:"not null;default:0" json:"completedPlays"`
+	RemainingBudget float64 `gorm:"not null;default:0" json:"remainingBudget"`
 
 	AdPlacements []AdPlacement `gorm:"foreignKey:AdID" json:"adPlacements,omitempty"`
 
@@ -141,8 +132,6 @@ type Ad struct {
 	UpdatedAt time.Time      `json:"updatedAt"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }
-
-// ──────────────── AD PLACEMENT ────────────────
 
 type AdPlacement struct {
 	ID   uint `gorm:"primaryKey" json:"id"`
@@ -155,18 +144,18 @@ type AdPlacement struct {
 	EventID uint   `gorm:"index" json:"eventId,omitempty"`
 	Event   *Event `gorm:"foreignKey:EventID" json:"-"`
 
-	Status string `gorm:"not null;default:'available'" json:"status"` // available | playing | completed
+	Status string `gorm:"not null;default:'playing'" json:"status"` // playing | completed | cancelled
 
-	EarnedAmount float64 `gorm:"not null;default:0" json:"earnedAmount"`
-	CreatorTier  string  `gorm:"not null" json:"creatorTier"` // free | pro
+	EarnedAmount   float64 `gorm:"not null;default:0" json:"earnedAmount"`
+	CreatorTier    string  `gorm:"not null" json:"creatorTier"` // free | pro
+	WatchedSeconds int     `gorm:"default:0" json:"watchedSeconds"`
 
-	PlayedAt *time.Time `json:"playedAt,omitempty"`
+	PlayedAt    *time.Time `json:"playedAt,omitempty"`
+	CompletedAt *time.Time `json:"completedAt,omitempty"`
 
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
-
-// ──────────────── OVERLAY ────────────────
 
 type Overlay struct {
 	ID     uint  `gorm:"primaryKey" json:"id"`
@@ -180,4 +169,42 @@ type Overlay struct {
 	CreatedAt time.Time      `json:"createdAt"`
 	UpdatedAt time.Time      `json:"updatedAt"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+type PlatformSetting struct {
+	ID uint `gorm:"primaryKey" json:"id"`
+
+	Currency               string  `gorm:"not null;default:'NRS'" json:"currency"`
+	ImageAdCharge          float64 `gorm:"not null;default:50" json:"imageAdCharge"`
+	VideoAdPerSecond       float64 `gorm:"not null;default:10" json:"videoAdPerSecond"`
+	AdminCommissionPercent float64 `gorm:"not null;default:30" json:"adminCommissionPercent"`
+	FreeCreatorPayoutPct   float64 `gorm:"not null;default:50" json:"freeCreatorPayoutPercent"`
+	ProSubscriptionPrice   float64 `gorm:"not null;default:999" json:"proSubscriptionPrice"`
+	FreeCameraLimit        int     `gorm:"not null;default:4" json:"freeCameraLimit"`
+
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+type PaymentIntent struct {
+	ID uint `gorm:"primaryKey" json:"id"`
+
+	UserID uint  `gorm:"index;not null" json:"userId"`
+	User   *User `gorm:"foreignKey:UserID" json:"-"`
+
+	WalletID uint    `gorm:"index;not null" json:"walletId"`
+	Wallet   *Wallet `gorm:"foreignKey:WalletID" json:"-"`
+
+	Provider        string     `gorm:"not null;default:'esewa'" json:"provider"`
+	Purpose         string     `gorm:"not null;default:'wallet_topup'" json:"purpose"`
+	PaymentRef      string     `gorm:"uniqueIndex;not null" json:"paymentRef"`
+	TransactionUUID string     `gorm:"uniqueIndex;not null" json:"transactionUuid"`
+	Amount          float64    `gorm:"not null" json:"amount"`
+	Currency        string     `gorm:"not null;default:'NRS'" json:"currency"`
+	Status          string     `gorm:"not null;default:'initiated'" json:"status"` // initiated | pending | complete | failed | ambiguous | cancelled
+	ProviderRef     string     `json:"providerRef,omitempty"`
+	RawResponse     string     `gorm:"type:text" json:"rawResponse,omitempty"`
+	VerifiedAt      *time.Time `json:"verifiedAt,omitempty"`
+
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }

@@ -4,9 +4,15 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 
+	"server/internal/models"
+	"server/internal/services"
+
+	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"gorm.io/gorm"
 )
 
 var upgrader = websocket.Upgrader{
@@ -38,14 +44,11 @@ type Hub struct {
 	Rooms map[string]*Room
 }
 
-var GlobalHub = &Hub{
-	Rooms: make(map[string]*Room),
-}
+var GlobalHub = &Hub{Rooms: make(map[string]*Room)}
 
 func (h *Hub) GetOrCreateRoom(code string) *Room {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
 	if room, ok := h.Rooms[code]; ok {
 		return room
 	}
@@ -66,10 +69,21 @@ func (r *Room) RemoveClient(clientID string) {
 	delete(r.Clients, clientID)
 }
 
+func (r *Room) CameraCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	for _, client := range r.Clients {
+		if client.Role == "camera" {
+			count++
+		}
+	}
+	return count
+}
+
 func (r *Room) BroadcastToOthers(senderID string, message []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
 	for id, client := range r.Clients {
 		if id != senderID {
 			select {
@@ -84,7 +98,6 @@ func (r *Room) BroadcastToOthers(senderID string, message []byte) {
 func (r *Room) SendToClient(targetID string, message []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
 	if client, exists := r.Clients[targetID]; exists {
 		select {
 		case client.Send <- message:
@@ -94,128 +107,119 @@ func (r *Room) SendToClient(targetID string, message []byte) {
 	}
 }
 
-func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Extract session code from URL
-	sessionCode := r.URL.Query().Get("code")
-	if sessionCode == "" {
-		// Try to get from path /ws/:code
-		path := r.URL.Path
-		if len(path) > 4 {
-			sessionCode = path[4:]
+func HandleWebSocket(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		sessionCode := c.Query("code")
+		if sessionCode == "" {
+			sessionCode = c.Param("code")
 		}
-	}
-
-	if sessionCode == "" {
-		log.Println("No session code provided")
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("WebSocket upgrade error:", err)
-		return
-	}
-
-	room := GlobalHub.GetOrCreateRoom(sessionCode)
-
-	// Variables to be initialized after join message
-	var client *Client
-	var clientID string
-
-	// Channel to signal when client is initialized
-	clientReady := make(chan struct{})
-
-	// Start write pump AFTER client is initialized
-	go func() {
-		// Wait for client to be initialized
-		<-clientReady
-		if client == nil {
+		sessionCode = strings.TrimSpace(sessionCode)
+		if sessionCode == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "session code required"})
 			return
 		}
-		for message := range client.Send {
-			if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				log.Println("Write error:", err)
+
+		var event models.Event
+		if err := db.Where("code = ?", sessionCode).First(&event).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "event not found"})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			log.Println("WebSocket upgrade error:", err)
+			return
+		}
+
+		room := GlobalHub.GetOrCreateRoom(sessionCode)
+		var client *Client
+		clientReady := make(chan struct{})
+		readyClosed := false
+
+		go func() {
+			<-clientReady
+			if client == nil {
 				return
 			}
-		}
-	}()
-
-	// Cleanup function
-	defer func() {
-		if client != nil {
-			room.RemoveClient(client.ID)
-			close(client.Send)
-			// Notify others
-			leaveMsg, _ := json.Marshal(SignalMessage{
-				Type: "client_left",
-				From: client.ID,
-				Data: json.RawMessage(`{"role":"` + client.Role + `"}`),
-			})
-			room.BroadcastToOthers(client.ID, leaveMsg)
-		}
-		conn.Close()
-	}()
-
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			log.Println("Read error:", err)
-			break
-		}
-
-		var msg SignalMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Println("Unmarshal error:", err)
-			continue
-		}
-
-		// Handle join message - this must be the first message
-		if msg.Type == "join" {
-			var joinData struct {
-				RoomCode   string `json:"room_code"`
-				Role       string `json:"role"`
-				CameraType string `json:"camera_type"`
+			for message := range client.Send {
+				if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+					log.Println("Write error:", err)
+					return
+				}
 			}
-			if err := json.Unmarshal(msg.Data, &joinData); err != nil {
-				log.Println("Failed to parse join data:", err)
+		}()
+
+		defer func() {
+			if !readyClosed {
+				close(clientReady)
+			}
+			if client != nil {
+				room.RemoveClient(client.ID)
+				close(client.Send)
+				if client.Role == "camera" && event.CameraCount > 0 {
+					db.Model(&event).Update("camera_count", gorm.Expr("GREATEST(camera_count - 1, 0)"))
+				}
+				leaveMsg, _ := json.Marshal(SignalMessage{Type: "client_left", From: client.ID, Data: json.RawMessage(`{"role":"` + client.Role + `"}`)})
+				room.BroadcastToOthers(client.ID, leaveMsg)
+			}
+			conn.Close()
+		}()
+
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				log.Println("Read error:", err)
+				break
+			}
+
+			var msg SignalMessage
+			if err := json.Unmarshal(message, &msg); err != nil {
+				log.Println("Unmarshal error:", err)
 				continue
 			}
 
-			clientID = msg.From
-			client = &Client{
-				ID:         clientID,
-				Conn:       conn,
-				Role:       joinData.Role,
-				CameraType: joinData.CameraType,
-				Send:       make(chan []byte, 256),
+			if msg.Type == "join" {
+				var joinData struct {
+					RoomCode   string `json:"room_code"`
+					Role       string `json:"role"`
+					CameraType string `json:"camera_type"`
+				}
+				if err := json.Unmarshal(msg.Data, &joinData); err != nil {
+					_ = conn.WriteJSON(gin.H{"type": "join_error", "error": "invalid join data"})
+					continue
+				}
+
+				role := strings.TrimSpace(joinData.Role)
+				if role == "camera" {
+					plan := services.GetCreatorPlan(db, event.CreatorID)
+					nextCameraCount := room.CameraCount() + 1
+					if !services.CanConnectCamera(db, plan, nextCameraCount) {
+						limit := services.MaxCamerasForPlan(db, plan)
+						_ = conn.WriteJSON(gin.H{"type": "join_rejected", "reason": "camera_limit", "message": "Camera limit reached. Upgrade to Pro for unlimited cameras.", "plan": plan, "maxCameras": limit})
+						return
+					}
+				}
+
+				client = &Client{ID: msg.From, Conn: conn, Role: role, CameraType: joinData.CameraType, Send: make(chan []byte, 256)}
+				room.AddClient(client)
+				if role == "camera" {
+					db.Model(&event).Update("camera_count", room.CameraCount())
+				}
+				close(clientReady)
+				readyClosed = true
+
+				log.Printf("Client %s joined room %s as %s", client.ID, sessionCode, client.Role)
+				joinNotify, _ := json.Marshal(SignalMessage{Type: "client_joined", From: client.ID, Data: json.RawMessage(`{"role":"` + client.Role + `","camera_type":"` + client.CameraType + `"}`)})
+				room.BroadcastToOthers(client.ID, joinNotify)
+				continue
 			}
-			room.AddClient(client)
 
-			// Signal that client is ready
-			close(clientReady)
-
-			log.Printf("Client %s joined room %s as %s", client.ID, sessionCode, client.Role)
-
-			// Notify others in the room
-			joinNotify, _ := json.Marshal(SignalMessage{
-				Type: "client_joined",
-				From: client.ID,
-				Data: json.RawMessage(`{"role":"` + client.Role + `","camera_type":"` + client.CameraType + `"}`),
-			})
-			room.BroadcastToOthers(client.ID, joinNotify)
-
-			continue
-		}
-
-		// Only forward messages if client is initialized
-		if client != nil && room != nil {
-			// If message has a target, send only to that client
-			if msg.Target != "" {
-				room.SendToClient(msg.Target, message)
-			} else {
-				// Otherwise broadcast to all others
-				room.BroadcastToOthers(client.ID, message)
+			if client != nil && room != nil {
+				if msg.Target != "" {
+					room.SendToClient(msg.Target, message)
+				} else {
+					room.BroadcastToOthers(client.ID, message)
+				}
 			}
 		}
 	}

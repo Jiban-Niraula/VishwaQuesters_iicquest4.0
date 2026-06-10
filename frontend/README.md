@@ -1,16 +1,57 @@
-# React + Vite
+# StreamAngle V2 Frontend - Full Studio Merge
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This frontend keeps the V2 role-based business system and restores the full V1 production studio engine.
 
-Currently, two official plugins are available:
+## Included
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Creator, Company, and Admin dashboards
+- Wallet + eSewa-ready top-up screens
+- Company sponsored ad creation
+- Admin ad approval/settings/wallet actions
+- Full V1 studio engine restored:
+  - multi-camera WebRTC studio
+  - camera join page
+  - viewer/watch page
+  - canvas production output
+  - layout switching
+  - overlays: text, scorecards, ads, image, replay, video link
+  - commentary microphone
+  - screen share
+  - camera zoom
+  - local camera clip recording/download
+  - audio source/mute controls
+  - RTMP destination controls
+  - worker-based canvas timer
+- V2 sponsored ads added inside the studio under the Ads panel
 
-## React Compiler
+## Run
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```powershell
+cd frontend
+copy .env.example .env
+npm install
+npm run dev
+```
 
-## Expanding the ESLint configuration
+## Backend expected
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Run the fixed V2 backend on:
+
+```txt
+http://localhost:8080
+```
+
+Default frontend env:
+
+```env
+VITE_API_URL=http://localhost:8080/api
+VITE_WS_URL=ws://localhost:8080/ws
+VITE_STREAM_WS_URL=ws://localhost:8080/api/stream/ws
+VITE_PUBLIC_UPLOAD_BASE=http://localhost:8080
+```
+
+## Important
+
+- FFmpeg must be installed on the backend machine for RTMP Go Live.
+- Sponsored ad payouts are credited only after completing the ad placement.
+- eSewa wallet credit must be verified by backend; frontend does not fake wallet balance.
