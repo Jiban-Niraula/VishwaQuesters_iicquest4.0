@@ -604,3 +604,6 @@ go.work.sum
 
 node_modules/*
 host/*
+
+go.mod
+go.sum
