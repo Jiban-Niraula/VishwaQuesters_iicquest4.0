@@ -79,6 +79,13 @@ func main() {
 
 		api.POST("/overlays", handlers.CreateOverlay)
 		api.GET("/overlays", handlers.ListOverlays)
+<<<<<<< HEAD
+=======
+		api.GET("/overlays/library", handlers.ListOverlayLibrary)
+		api.POST("/overlays/upload", handlers.UploadOverlayMedia)
+		api.POST("/overlays/:id/activate", handlers.ActivateOverlay)
+		api.POST("/overlays/:id/deactivate", handlers.DeactivateOverlay)
+>>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 		api.PUT("/overlays/:id", handlers.UpdateOverlay)
 		api.DELETE("/overlays/:id", handlers.DeleteOverlay)
 
@@ -146,7 +153,11 @@ func ensureDefaultAdmin(db *gorm.DB) {
 		return
 	}
 
+<<<<<<< HEAD
 	email := config.Env("ADMIN_EMAIL", "admin@streamangle.com")
+=======
+	email := config.Env("ADMIN_EMAIL", "admin@visioncast.local")
+>>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 	password := config.Env("ADMIN_PASSWORD", "change_this_admin_password")
 	if password == "admin123" || password == "change_this_admin_password" {
 		log.Println("WARNING: using weak/default admin password. Change ADMIN_PASSWORD in .env before real use.")

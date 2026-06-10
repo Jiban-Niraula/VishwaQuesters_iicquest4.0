@@ -158,13 +158,39 @@ type AdPlacement struct {
 }
 
 type Overlay struct {
-	ID     uint  `gorm:"primaryKey" json:"id"`
-	UserID uint  `gorm:"index;not null" json:"userId"`
-	User   *User `gorm:"foreignKey:UserID" json:"-"`
+	ID uint `gorm:"primaryKey" json:"id"`
 
-	Name    string `gorm:"not null" json:"name"`
-	Type    string `gorm:"not null" json:"type"`
-	Content string `gorm:"type:text" json:"content"`
+	CreatorID uint  `gorm:"index;not null" json:"creatorId"`
+	Creator   *User `gorm:"foreignKey:CreatorID" json:"-"`
+
+	EventID *uint  `gorm:"index" json:"eventId,omitempty"`
+	Event   *Event `gorm:"foreignKey:EventID" json:"-"`
+
+	AdID *uint `gorm:"index" json:"adId,omitempty"`
+	Ad   *Ad   `gorm:"foreignKey:AdID" json:"ad,omitempty"`
+
+	Title    string `gorm:"not null" json:"title"`
+	Type     string `gorm:"not null" json:"type"` // text | image | video | scoreboard | timer | sponsored_ad | ad | replay | video-link
+	Content  string `gorm:"type:text" json:"content,omitempty"`
+	MediaURL string `json:"mediaUrl,omitempty"`
+	Position string `gorm:"not null;default:'top-right'" json:"position"`
+	Duration int    `gorm:"not null;default:0" json:"duration"`
+
+	X       float64 `gorm:"default:0" json:"x"`
+	Y       float64 `gorm:"default:0" json:"y"`
+	Width   float64 `gorm:"default:360" json:"width"`
+	Height  float64 `gorm:"default:120" json:"height"`
+	Opacity float64 `gorm:"default:1" json:"opacity"`
+	ZIndex  int     `gorm:"default:1" json:"zIndex"`
+
+	StyleJSON string `gorm:"type:text" json:"styleJson,omitempty"`
+	DataJSON  string `gorm:"type:text" json:"dataJson,omitempty"`
+
+	IsActive bool `gorm:"default:false" json:"isActive"`
+	IsGlobal bool `gorm:"default:false" json:"isGlobal"`
+
+	StartedAt *time.Time `json:"startedAt,omitempty"`
+	EndedAt   *time.Time `json:"endedAt,omitempty"`
 
 	CreatedAt time.Time      `json:"createdAt"`
 	UpdatedAt time.Time      `json:"updatedAt"`
