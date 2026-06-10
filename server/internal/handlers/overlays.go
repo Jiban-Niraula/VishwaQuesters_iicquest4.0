@@ -1,24 +1,18 @@
 package handlers
 
 import (
-<<<<<<< HEAD
-	"net/http"
-=======
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 
 	"server/internal/models"
 
 	"github.com/gin-gonic/gin"
 )
 
-<<<<<<< HEAD
-=======
 var allowedOverlayTypes = map[string]bool{
 	"text": true, "image": true, "video": true, "scoreboard": true, "timer": true,
 	"lower_third": true, "logo": true, "banner": true, "sponsored_ad": true,
@@ -26,7 +20,6 @@ var allowedOverlayTypes = map[string]bool{
 	"football-scorecard": true, "cricket-scorecard": true, "ad": true, "replay": true, "video-link": true,
 }
 
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 func CreateOverlay(c *gin.Context) {
 	userID, ok := getUserID(c)
 	if !ok {
@@ -34,28 +27,12 @@ func CreateOverlay(c *gin.Context) {
 		return
 	}
 
-<<<<<<< HEAD
-	var input struct {
-		Name    string `json:"name" binding:"required"`
-		Type    string `json:"type" binding:"required"`
-		Content string `json:"content" binding:"required"`
-	}
-
-=======
 	var input overlayInput
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-<<<<<<< HEAD
-	overlay := models.Overlay{
-		UserID:  userID,
-		Name:    input.Name,
-		Type:    input.Type,
-		Content: input.Content,
-=======
 	title := firstNonEmptyString(input.Title, input.Name, "Untitled overlay")
 	typeName := strings.TrimSpace(input.Type)
 	if typeName == "" {
@@ -102,7 +79,6 @@ func CreateOverlay(c *gin.Context) {
 	if overlay.IsActive {
 		now := time.Now()
 		overlay.StartedAt = &now
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 	}
 
 	if err := db.Create(&overlay).Error; err != nil {
@@ -120,10 +96,6 @@ func ListOverlays(c *gin.Context) {
 		return
 	}
 
-<<<<<<< HEAD
-	var overlays []models.Overlay
-	db.Where("user_id = ?", userID).Order("created_at DESC").Find(&overlays)
-=======
 	query := db.Where("creator_id = ?", userID)
 
 	if eventID, ok := parseUintQuery(c, "event_id"); ok {
@@ -155,7 +127,6 @@ func ListOverlayLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list overlay library"})
 		return
 	}
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 
 	c.JSON(http.StatusOK, overlays)
 }
@@ -174,37 +145,18 @@ func UpdateOverlay(c *gin.Context) {
 	}
 
 	var overlay models.Overlay
-<<<<<<< HEAD
-	if err := db.Where("id = ? AND user_id = ?", overlayID, userID).First(&overlay).Error; err != nil {
-=======
 	if err := db.Where("id = ? AND creator_id = ?", overlayID, userID).First(&overlay).Error; err != nil {
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 		c.JSON(http.StatusNotFound, gin.H{"error": "Overlay not found"})
 		return
 	}
 
-<<<<<<< HEAD
-	var input struct {
-		Name    *string `json:"name"`
-		Type    *string `json:"type"`
-		Content *string `json:"content"`
-	}
-
-=======
 	var input overlayUpdateInput
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	updates := map[string]interface{}{}
-<<<<<<< HEAD
-	if input.Name != nil {
-		updates["name"] = *input.Name
-	}
-	if input.Type != nil {
-=======
 	if input.Title != nil {
 		updates["title"] = strings.TrimSpace(*input.Title)
 	}
@@ -216,18 +168,11 @@ func UpdateOverlay(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported overlay type"})
 			return
 		}
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 		updates["type"] = *input.Type
 	}
 	if input.Content != nil {
 		updates["content"] = *input.Content
 	}
-<<<<<<< HEAD
-
-	db.Model(&overlay).Updates(updates)
-	db.Where("id = ?", overlayID).First(&overlay)
-
-=======
 	if input.MediaURL != nil {
 		updates["media_url"] = normalizePath(*input.MediaURL)
 	}
@@ -293,7 +238,6 @@ func UpdateOverlay(c *gin.Context) {
 	}
 
 	db.First(&overlay, overlayID)
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 	c.JSON(http.StatusOK, overlay)
 }
 
@@ -311,11 +255,7 @@ func DeleteOverlay(c *gin.Context) {
 	}
 
 	var overlay models.Overlay
-<<<<<<< HEAD
-	if err := db.Where("id = ? AND user_id = ?", overlayID, userID).First(&overlay).Error; err != nil {
-=======
 	if err := db.Where("id = ? AND creator_id = ?", overlayID, userID).First(&overlay).Error; err != nil {
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
 		c.JSON(http.StatusNotFound, gin.H{"error": "Overlay not found"})
 		return
 	}
@@ -323,8 +263,6 @@ func DeleteOverlay(c *gin.Context) {
 	db.Delete(&overlay)
 	c.JSON(http.StatusOK, gin.H{"message": "Overlay deleted"})
 }
-<<<<<<< HEAD
-=======
 
 func ActivateOverlay(c *gin.Context)   { setOverlayActive(c, true) }
 func DeactivateOverlay(c *gin.Context) { setOverlayActive(c, false) }
@@ -506,4 +444,3 @@ func normalizePath(path string) string {
 	}
 	return strings.ReplaceAll(trimmed, "\\", "/")
 }
->>>>>>> 251cf1257b274753a7f4a9b6df11285a503078a3
