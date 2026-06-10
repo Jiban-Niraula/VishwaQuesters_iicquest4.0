@@ -19,7 +19,7 @@ func Register(db *gorm.DB) gin.HandlerFunc {
 			Email    string `json:"email" binding:"required,email"`
 			Password string `json:"password" binding:"required,min=8"`
 			Name     string `json:"name" binding:"required"`
-			Role     string `json:"role" binding:"required,oneof=creator company admin"`
+			Role     string `json:"role" binding:"required,oneof=creator company"`
 		}
 
 		if err := c.ShouldBindJSON(&input); err != nil {
@@ -33,58 +33,24 @@ func Register(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		user := models.User{
-			Email:        input.Email,
-			Name:         input.Name,
-			PasswordHash: string(hash),
-			Role:         input.Role,
-		}
-
+		user := models.User{Email: input.Email, Name: input.Name, PasswordHash: string(hash), Role: input.Role}
 		if err := db.Create(&user).Error; err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Email already exists"})
 			return
 		}
 
-		// Create wallet for all users
-		wallet := models.Wallet{
-			UserID:   user.ID,
-			Balance:  0,
-			Currency: "NRS",
-		}
-		db.Create(&wallet)
-
-		// Create free subscription for creators
+		_ = db.Create(&models.Wallet{UserID: user.ID, Balance: 0, Currency: config.Env("WALLET_CURRENCY", "NRS")}).Error
 		if user.Role == "creator" {
-			sub := models.Subscription{
-				UserID:    user.ID,
-				Plan:      "free",
-				Status:    "active",
-				StartedAt: time.Now(),
-			}
-			db.Create(&sub)
+			_ = db.Create(&models.Subscription{UserID: user.ID, Plan: "free", Status: "active", StartedAt: time.Now()}).Error
 		}
 
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"userID": user.ID,
-			"role":   user.Role,
-			"exp":    time.Now().Add(time.Hour * 24).Unix(),
-		})
-
-		tokenString, err := token.SignedString(config.JWTSecret)
+		tokenString, err := createToken(user)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 			return
 		}
 
-		c.JSON(http.StatusCreated, gin.H{
-			"token": tokenString,
-			"user": gin.H{
-				"id":    user.ID,
-				"email": user.Email,
-				"name":  user.Name,
-				"role":  user.Role,
-			},
-		})
+		c.JSON(http.StatusCreated, gin.H{"token": tokenString, "user": publicUser(user)})
 	}
 }
 
@@ -111,31 +77,16 @@ func Login(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"userID": user.ID,
-			"role":   user.Role,
-			"exp":    time.Now().Add(time.Hour * 24).Unix(),
-		})
-
-		tokenString, err := token.SignedString(config.JWTSecret)
+		tokenString, err := createToken(user)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"token": tokenString,
-			"user": gin.H{
-				"id":    user.ID,
-				"email": user.Email,
-				"name":  user.Name,
-				"role":  user.Role,
-			},
-		})
+		c.JSON(http.StatusOK, gin.H{"token": tokenString, "user": publicUser(user)})
 	}
 }
 
-// GetMe returns the current authenticated user's profile with wallet & subscription
 func GetMe(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID, ok := getUserID(c)
@@ -160,4 +111,17 @@ func GetMe(db *gorm.DB) gin.HandlerFunc {
 			"subscription": user.Subscription,
 		})
 	}
+}
+
+func createToken(user models.User) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"userID": user.ID,
+		"role":   user.Role,
+		"exp":    time.Now().Add(24 * time.Hour).Unix(),
+	})
+	return token.SignedString(config.JWTSecret)
+}
+
+func publicUser(user models.User) gin.H {
+	return gin.H{"id": user.ID, "email": user.Email, "name": user.Name, "role": user.Role}
 }

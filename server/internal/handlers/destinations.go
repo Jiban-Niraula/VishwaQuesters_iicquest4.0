@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+
 	"server/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -15,8 +16,8 @@ func AddDestination(c *gin.Context) {
 	}
 
 	var input struct {
-		EventID   uint   `json:"event_id"`
-		Platform  string `json:"platform" binding:"required"`
+		EventID   uint   `json:"event_id" binding:"required"`
+		Platform  string `json:"platform" binding:"required,oneof=youtube facebook twitch custom"`
 		StreamKey string `json:"stream_key" binding:"required"`
 		ServerURL string `json:"server_url"`
 	}
@@ -26,35 +27,28 @@ func AddDestination(c *gin.Context) {
 		return
 	}
 
-	// Verify ownership
 	var event models.Event
-	if err := db.Where("id = ? AND user_id = ?", input.EventID, userID).First(&event).Error; err != nil {
+	if err := db.Where("id = ? AND creator_id = ?", input.EventID, userID).First(&event).Error; err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Event not found or not owned by you"})
 		return
 	}
 
-	// Default server URLs based on platform
-	// NOTE: URLs must end with "/" so that appending the stream key is correct
 	serverURL := input.ServerURL
 	if serverURL == "" {
 		switch input.Platform {
 		case "youtube":
-			serverURL = "rtmp://a.rtmp.youtube.com/live2/"
+			serverURL = "rtmp://a.rtmp.youtube.com/live2"
 		case "facebook":
-			serverURL = "rtmps://live-api-s.facebook.com:443/rtmp/"
+			serverURL = "rtmps://live-api-s.facebook.com:443/rtmp"
 		case "twitch":
-			serverURL = "rtmp://live.twitch.tv/app/"
+			serverURL = "rtmp://live.twitch.tv/app"
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "server_url is required for custom RTMP"})
+			return
 		}
 	}
 
-	dest := models.StreamDestination{
-		EventID:   input.EventID,
-		Platform:  input.Platform,
-		StreamKey: input.StreamKey,
-		ServerURL: serverURL,
-		IsActive:  false,
-	}
-
+	dest := models.StreamDestination{EventID: input.EventID, Platform: input.Platform, StreamKey: input.StreamKey, ServerURL: serverURL, IsActive: false}
 	if err := db.Create(&dest).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add destination"})
 		return
@@ -77,14 +71,13 @@ func ListDestinations(c *gin.Context) {
 	}
 
 	var event models.Event
-	if err := db.Where("id = ? AND user_id = ?", eventID, userID).First(&event).Error; err != nil {
+	if err := db.Where("id = ? AND creator_id = ?", eventID, userID).First(&event).Error; err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Event not found"})
 		return
 	}
 
 	var dests []models.StreamDestination
 	db.Where("event_id = ?", eventID).Find(&dests)
-
 	c.JSON(http.StatusOK, dests)
 }
 
@@ -108,7 +101,7 @@ func UpdateDestination(c *gin.Context) {
 	}
 
 	var event models.Event
-	if err := db.Where("id = ? AND user_id = ?", dest.EventID, userID).First(&event).Error; err != nil {
+	if err := db.Where("id = ? AND creator_id = ?", dest.EventID, userID).First(&event).Error; err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized"})
 		return
 	}
@@ -118,7 +111,6 @@ func UpdateDestination(c *gin.Context) {
 		ServerURL *string `json:"server_url"`
 		IsActive  *bool   `json:"is_active"`
 	}
-
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -137,7 +129,6 @@ func UpdateDestination(c *gin.Context) {
 
 	db.Model(&dest).Updates(updates)
 	db.First(&dest, destID)
-
 	c.JSON(http.StatusOK, dest)
 }
 
@@ -161,7 +152,7 @@ func DeleteDestination(c *gin.Context) {
 	}
 
 	var event models.Event
-	if err := db.Where("id = ? AND user_id = ?", dest.EventID, userID).First(&event).Error; err != nil {
+	if err := db.Where("id = ? AND creator_id = ?", dest.EventID, userID).First(&event).Error; err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Not authorized"})
 		return
 	}
