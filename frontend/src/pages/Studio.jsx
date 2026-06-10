@@ -690,99 +690,221 @@ export default function Studio() {
   }, []);
 
   // Start WebSocket streaming to backend
+  // Start WebSocket streaming to backend
   const startWebSocketStreaming = useCallback(
     async (stream) => {
       const token = localStorage.getItem("streamangle_token");
-      const activeDests = destinations.filter((d) => d.is_active);
-      if (activeDests.length === 0) {
-        console.log("No active destinations");
+      const activeDests = destinations.filter((d) => d.is_active || d.isActive);
+
+      if (!token) {
+        console.error("No auth token found for RTMP stream WebSocket");
         return false;
       }
 
-      const dest = activeDests[0];
-      const wsUrl = `${import.meta.env.VITE_STREAM_WS_URL || (window.location.protocol === "https:" ? "wss:" : "ws:") + "//" + window.location.host + "/api/stream/ws"}?token=${encodeURIComponent(token)}&dest_id=${dest.id}`;
+      if (activeDests.length === 0) {
+        console.log(
+          "No active RTMP destinations. Platform watch stream can still work.",
+        );
+        return false;
+      }
 
-      console.log("Connecting WebSocket for streaming...");
-      const ws = new WebSocket(wsUrl);
+      const buildStreamWsUrl = (destId) => {
+        let base =
+          import.meta.env.VITE_STREAM_WS_URL ||
+          `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/api/stream/ws`;
 
-      ws.onopen = () => {
-        console.log("✅ WebSocket open, creating MediaRecorder");
+        base = String(base).trim().replace(/\/+$/, "");
 
-        // Priority order: VP8 is the most stable for MediaRecorder chunking.
-        // Chrome's H.264 encoder produces extremely blurry/blocky output and
-        // drops bitrate when used with small timeslices.
-        const mimeTypes = [
-          "video/webm;codecs=h264,opus", // Hardware accelerated, best for 1080p lag-free
-          "video/webm;codecs=vp9,opus", // High quality but heavier CPU
-          "video/webm;codecs=vp8,opus", // Fallback
-          "video/webm",
-        ];
-        let selectedMime = "";
-        for (const mime of mimeTypes) {
-          if (MediaRecorder.isTypeSupported(mime)) {
-            selectedMime = mime;
-            break;
-          }
-        }
-        console.log(`Using MediaRecorder mimeType: ${selectedMime}`);
+        return `${base}?token=${encodeURIComponent(token)}&dest_id=${encodeURIComponent(destId)}`;
+      };
 
-        // Verify audio tracks are enabled
-        const audioTracks = stream.getAudioTracks();
-        console.log(`Audio tracks in stream: ${audioTracks.length}`);
-        audioTracks.forEach((t) => {
-          console.log(`  - ${t.label} enabled: ${t.enabled}`);
-          t.enabled = true;
+      const waitForOpen = (ws, label) => {
+        return new Promise((resolve) => {
+          let done = false;
+
+          const finish = (result) => {
+            if (done) return;
+            done = true;
+            resolve(result);
+          };
+
+          const timer = setTimeout(() => {
+            console.warn(`[RTMP WS] Timeout opening socket for ${label}`);
+            try {
+              ws.close();
+            } catch {}
+            finish(null);
+          }, 8000);
+
+          ws.onopen = () => {
+            clearTimeout(timer);
+            console.log(`[RTMP WS] Connected: ${label}`);
+            finish(ws);
+          };
+
+          ws.onerror = (error) => {
+            clearTimeout(timer);
+            console.error(`[RTMP WS] Error for ${label}:`, error);
+            finish(null);
+          };
         });
+      };
 
-        // FIX: Create a separate capture stream for the MediaRecorder to prevent Chromium from freezing the WebRTC track
-        const wsStream = new MediaStream();
-        if (canvasRef.current) {
-          canvasRef.current
-            .captureStream(30)
-            .getVideoTracks()
-            .forEach((t) => wsStream.addTrack(t));
-        }
-        audioTracks.forEach((t) => wsStream.addTrack(t));
+      // Close old RTMP sockets before starting a new recorder.
+      if (streamWSRef.current?.close) {
+        streamWSRef.current.close();
+      }
 
-        const mediaRecorder = new MediaRecorder(wsStream, {
-          mimeType: selectedMime,
-          videoBitsPerSecond: 6_000_000, // Ask browser for 6 Mbps quality (1080p)
-          audioBitsPerSecond: 160_000,
-        });
+      if (
+        mediaRecorderRef.current &&
+        mediaRecorderRef.current.state === "recording"
+      ) {
+        mediaRecorderRef.current.stop();
+      }
 
-        mediaRecorder.ondataavailable = (event) => {
-          if (
-            event.data &&
-            event.data.size > 0 &&
-            ws.readyState === WebSocket.OPEN
-          ) {
-            ws.send(event.data);
-            if (Math.random() < 0.1) {
-              console.log(`📹 Chunk: ${event.data.size} bytes`);
-            }
-          }
+      const sockets = activeDests.map((dest) => {
+        const ws = new WebSocket(buildStreamWsUrl(dest.id));
+        ws.binaryType = "arraybuffer";
+
+        ws.onclose = () => {
+          console.log(`[RTMP WS] Closed for destination ${dest.id}`);
         };
 
-        mediaRecorder.onerror = (e) => console.error("MediaRecorder error:", e);
+        return {
+          id: dest.id,
+          label: `${dest.platform || "RTMP"} #${dest.id}`,
+          ws,
+        };
+      });
 
-        // 2000ms chunks: ensures the browser has enough time to generate
-        // high-quality, complete WebM clusters and prevents H.264 I-frame reset lag.
-        mediaRecorder.start(2000);
-        mediaRecorderRef.current = mediaRecorder;
+      const opened = await Promise.all(
+        sockets.map(async (item) => {
+          const openedWs = await waitForOpen(item.ws, item.label);
+          return openedWs ? item : null;
+        }),
+      );
+
+      const openSockets = opened.filter(Boolean);
+
+      if (openSockets.length === 0) {
+        console.error("No RTMP WebSocket connections opened.");
+        return false;
+      }
+
+      streamWSRef.current = {
+        close: () => {
+          sockets.forEach(({ ws }) => {
+            try {
+              if (
+                ws.readyState === WebSocket.OPEN ||
+                ws.readyState === WebSocket.CONNECTING
+              ) {
+                ws.close();
+              }
+            } catch {}
+          });
+        },
       };
 
-      ws.onerror = (error) => console.error("WebSocket error:", error);
-      ws.onclose = () => {
-        console.log("WebSocket closed");
-        if (
-          mediaRecorderRef.current &&
-          mediaRecorderRef.current.state === "recording"
-        ) {
-          mediaRecorderRef.current.stop();
+      console.log(
+        `[RTMP WS] Ready. Sending one MediaRecorder stream to ${openSockets.length} destination(s).`,
+      );
+
+      const mimeTypes = [
+        "video/webm;codecs=vp8,opus",
+        "video/webm;codecs=vp9,opus",
+        "video/webm",
+      ];
+
+      let selectedMime = "";
+
+      for (const mime of mimeTypes) {
+        if (MediaRecorder.isTypeSupported(mime)) {
+          selectedMime = mime;
+          break;
+        }
+      }
+
+      console.log(
+        `Using MediaRecorder mimeType: ${selectedMime || "browser default"}`,
+      );
+
+      const audioTracks = stream.getAudioTracks();
+
+      audioTracks.forEach((track) => {
+        track.enabled = true;
+      });
+
+      const wsStream = new MediaStream();
+
+      // Use a fresh canvas capture track for RTMP so viewer WebRTC does not freeze.
+      if (canvasRef.current) {
+        const freshCanvasStream = canvasRef.current.captureStream(30);
+
+        freshCanvasStream.getVideoTracks().forEach((track) => {
+          wsStream.addTrack(track);
+        });
+      } else {
+        stream.getVideoTracks().forEach((track) => {
+          wsStream.addTrack(track);
+        });
+      }
+
+      audioTracks.forEach((track) => {
+        wsStream.addTrack(track);
+      });
+
+      console.log(
+        `[RTMP WS] Recorder stream tracks: video=${wsStream.getVideoTracks().length}, audio=${wsStream.getAudioTracks().length}`,
+      );
+
+      const recorderOptions = {
+        videoBitsPerSecond: 4_500_000,
+        audioBitsPerSecond: 160_000,
+      };
+
+      if (selectedMime) {
+        recorderOptions.mimeType = selectedMime;
+      }
+
+      const mediaRecorder = new MediaRecorder(wsStream, recorderOptions);
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (!event.data || event.data.size === 0) return;
+
+        openSockets.forEach(({ id, ws }) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(event.data);
+          } else {
+            console.warn(
+              `[RTMP WS] Destination ${id} socket not open, chunk skipped`,
+            );
+          }
+        });
+
+        if (Math.random() < 0.1) {
+          console.log(
+            `[RTMP WS] Chunk ${event.data.size} bytes sent to ${openSockets.length} destination(s)`,
+          );
         }
       };
 
-      streamWSRef.current = ws;
+      mediaRecorder.onerror = (event) => {
+        console.error("[RTMP WS] MediaRecorder error:", event);
+      };
+
+      mediaRecorder.onstop = () => {
+        console.log("[RTMP WS] MediaRecorder stopped");
+
+        if (streamWSRef.current?.close) {
+          streamWSRef.current.close();
+        }
+      };
+
+      // 1000ms chunks are easier for FFmpeg to keep live.
+      mediaRecorder.start(1000);
+      mediaRecorderRef.current = mediaRecorder;
+
       return true;
     },
     [destinations],

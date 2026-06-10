@@ -50,37 +50,42 @@ func (r *RTMPStreamer) StartStream(destinationID uint, serverURL, streamKey stri
 		r.logFiles[destinationID] = logFile
 	}
 
-	// NOTE: Do NOT use -re for piped input — it throttles to "native rate"
-	// which causes lag to build up over time. It is only for file inputs.
 	args := []string{
-		// ── Input ──────────────────────────────────────────────────────────────
-		"-fflags", "nobuffer", // Disable input buffering — critical for low latency
-		"-flags", "low_delay", // Enable low-delay decoding mode
-		"-probesize", "32", // Probe only 32 bytes — reduces startup delay
-		"-analyzeduration", "0", // Skip stream analysis — start encoding immediately
-		"-i", "pipe:0", // Browser WebM (video + audio) from stdin
+		"-hide_banner",
+		"-loglevel", "info",
 
-		// ── Video encoding ─────────────────────────────────────────────────────
-		"-r", "30", // Force constant 30fps output (YouTube requires CFR)
+		// Browser MediaRecorder sends WebM chunks through stdin.
+		// Do not use tiny probe values here. FFmpeg needs enough data
+		// to detect VP8/VP9 + Opus correctly.
+		"-fflags", "+genpts",
+		"-use_wallclock_as_timestamps", "1",
+		"-thread_queue_size", "1024",
+		"-probesize", "100M",
+		"-analyzeduration", "100M",
+		"-f", "webm",
+		"-i", "pipe:0",
+
+		// Video output for YouTube/Facebook/Twitch RTMP.
+		"-vf", "fps=30,format=yuv420p",
 		"-c:v", "libx264",
-		"-preset", "superfast", // Faster preset to prevent lagging at 1080p
-		"-b:v", "6000k", // 6 Mbps target — Standard for 1080p30
-		"-maxrate", "6000k", // Strict CBR max
-		"-minrate", "6000k", // Strict CBR min (forces high-quality padding)
-		"-bufsize", "12000k", // Rate-control buffer = 2× target bitrate
-		"-pix_fmt", "yuv420p", // Required for YouTube/Facebook compatibility
-		"-g", "30", // Keyframe every 1 second at 30fps (was 2s)
-		"-sc_threshold", "0", // Disable scene-change extra keyframes
-		"-threads", "0", // Auto-detect optimal thread count
+		"-preset", "veryfast",
+		"-tune", "zerolatency",
+		"-b:v", "4500k",
+		"-maxrate", "4500k",
+		"-bufsize", "9000k",
+		"-g", "60",
+		"-keyint_min", "60",
+		"-sc_threshold", "0",
 
-		// ── Audio encoding ─────────────────────────────────────────────────────
+		// Audio output.
 		"-c:a", "aac",
-		"-b:a", "160k", // 160 kbps — above YouTube's 128 kbps warning
-		"-ar", "48000", // 48 kHz sample rate (broadcast standard)
-		"-ac", "2", // Stereo output
+		"-b:a", "160k",
+		"-ar", "48000",
+		"-ac", "2",
 
-		// ── Output ─────────────────────────────────────────────────────────────
+		// RTMP/FLV output.
 		"-f", "flv",
+		"-flvflags", "no_duration_filesize",
 		"-rtmp_live", "live",
 		rtmpURL,
 	}
@@ -98,11 +103,12 @@ func (r *RTMPStreamer) StartStream(destinationID uint, serverURL, streamKey stri
 	}
 
 	if logFile != nil {
+		cmd.Stdout = logFile
 		cmd.Stderr = io.MultiWriter(os.Stderr, logFile)
 	} else {
+		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 	}
-	cmd.Stdout = logFile
 
 	if err := cmd.Start(); err != nil {
 		stdin.Close()
