@@ -12,14 +12,15 @@ import (
 )
 
 type AdPricing struct {
-	BaseChargePerPlay float64
-	ChargeAmount      float64
-	AdminCommission   float64
-	CreatorPayoutPro  float64
-	CreatorPayoutFree float64
-	RemainingBudget   float64
-	MaxPlays          int
-	Settings          models.PlatformSetting
+	CostPerView              float64
+	CampaignBudget           float64
+	EstimatedViews           int
+	AdminCommissionPercent   float64
+	FreeCreatorPayoutPct     float64
+	CreatorPayoutProPerView  float64
+	CreatorPayoutFreePerView float64
+	MaxPlays                 int
+	Settings                 models.PlatformSetting
 }
 
 func EnsureDefaultPlatformSettings(db *gorm.DB) error {
@@ -55,7 +56,13 @@ func GetPlatformSettings(db *gorm.DB) (models.PlatformSetting, error) {
 	return setting, err
 }
 
-func CalculateAdPricing(db *gorm.DB, adType string, durationSeconds int, maxPlays int) (AdPricing, error) {
+// New model:
+// ImageAdCharge = price per 100 platform views for image ad.
+// VideoAdPerSecond = price per 100 platform views per video second.
+// Example:
+// image_ad_charge = 50 => NRS 0.50 per verified platform view
+// video_ad_per_second = 10 and duration 15s => NRS 1.50 per verified platform view
+func CalculateAdCampaignPricing(db *gorm.DB, adType string, durationSeconds int, campaignBudget float64, maxPlays int) (AdPricing, error) {
 	if adType != "image" && adType != "video" {
 		return AdPricing{}, errors.New("invalid ad type")
 	}
@@ -64,6 +71,54 @@ func CalculateAdPricing(db *gorm.DB, adType string, durationSeconds int, maxPlay
 		return AdPricing{}, errors.New("duration_seconds is required for video ads")
 	}
 
+	if campaignBudget < 10 {
+		return AdPricing{}, errors.New("campaign_budget must be at least 10")
+	}
+
+	if maxPlays <= 0 {
+		maxPlays = 1000000
+	}
+
+	setting, err := GetPlatformSettings(db)
+	if err != nil {
+		return AdPricing{}, err
+	}
+
+	ratePer100Views := setting.ImageAdCharge
+	if adType == "video" {
+		ratePer100Views = float64(durationSeconds) * setting.VideoAdPerSecond
+	}
+
+	costPerView := ratePer100Views / 100
+	if costPerView <= 0 {
+		return AdPricing{}, errors.New("invalid cost per view from platform settings")
+	}
+
+	adminPercent := clampPercent(setting.AdminCommissionPercent)
+	freePayoutPct := clampPercent(setting.FreeCreatorPayoutPct)
+
+	creatorPoolPerView := costPerView * ((100 - adminPercent) / 100)
+	proPayoutPerView := creatorPoolPerView
+	freePayoutPerView := creatorPoolPerView * (freePayoutPct / 100)
+
+	estimatedViews := int(math.Floor(campaignBudget / costPerView))
+
+	return AdPricing{
+		CostPerView:              round2(costPerView),
+		CampaignBudget:           round2(campaignBudget),
+		EstimatedViews:           estimatedViews,
+		AdminCommissionPercent:   adminPercent,
+		FreeCreatorPayoutPct:     freePayoutPct,
+		CreatorPayoutProPerView:  round2(proPayoutPerView),
+		CreatorPayoutFreePerView: round2(freePayoutPerView),
+		MaxPlays:                 maxPlays,
+		Settings:                 setting,
+	}, nil
+}
+
+// Backward-compatible wrapper for old callers.
+// It converts old max_plays pricing into a campaign budget.
+func CalculateAdPricing(db *gorm.DB, adType string, durationSeconds int, maxPlays int) (AdPricing, error) {
 	if maxPlays <= 0 {
 		maxPlays = 1
 	}
@@ -75,24 +130,13 @@ func CalculateAdPricing(db *gorm.DB, adType string, durationSeconds int, maxPlay
 
 	base := setting.ImageAdCharge
 	if adType == "video" {
+		if durationSeconds <= 0 {
+			return AdPricing{}, errors.New("duration_seconds is required for video ads")
+		}
 		base = float64(durationSeconds) * setting.VideoAdPerSecond
 	}
 
-	totalCharge := base * float64(maxPlays)
-	adminCommissionPerPlay := base * (setting.AdminCommissionPercent / 100)
-	creatorPoolPerPlay := base - adminCommissionPerPlay
-	freePayoutPerPlay := creatorPoolPerPlay * (setting.FreeCreatorPayoutPct / 100)
-
-	return AdPricing{
-		BaseChargePerPlay: round2(base),
-		ChargeAmount:      round2(totalCharge),
-		AdminCommission:   round2(adminCommissionPerPlay * float64(maxPlays)),
-		CreatorPayoutPro:  round2(creatorPoolPerPlay),
-		CreatorPayoutFree: round2(freePayoutPerPlay),
-		RemainingBudget:   round2(creatorPoolPerPlay * float64(maxPlays)),
-		MaxPlays:          maxPlays,
-		Settings:          setting,
-	}, nil
+	return CalculateAdCampaignPricing(db, adType, durationSeconds, base*float64(maxPlays), maxPlays)
 }
 
 func GetCreatorPayout(ad models.Ad, creatorPlan string) float64 {
@@ -103,7 +147,14 @@ func GetCreatorPayout(ad models.Ad, creatorPlan string) float64 {
 }
 
 func GetReservedCreatorPoolPerPlay(ad models.Ad) float64 {
-	return ad.CreatorPayoutPro
+	return ad.CostPerView
+}
+
+func CanAdRun(ad models.Ad) bool {
+	return ad.Status == "approved" &&
+		ad.CompletedPlays < ad.MaxPlays &&
+		ad.RemainingBudget >= ad.CostPerView &&
+		ad.CostPerView > 0
 }
 
 func CanUploadAd(creatorPlan string) bool {
@@ -145,14 +196,20 @@ func MaxCamerasForPlan(db *gorm.DB, plan string) int {
 }
 
 func CanConnectCamera(db *gorm.DB, plan string, nextCameraCount int) bool {
-	if plan == "pro" {
-		return true
-	}
-
 	limit := MaxCamerasForPlan(db, plan)
-	return nextCameraCount <= limit
+	return limit < 0 || nextCameraCount <= limit
 }
 
 func round2(v float64) float64 {
 	return math.Round(v*100) / 100
+}
+
+func clampPercent(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
 }

@@ -2539,22 +2539,37 @@ export default function Studio() {
 
   // Destination handlers
   const handlePlaySponsoredAd = async (item) => {
-    if (!eventData) return;
+    if (!eventData) {
+      alert("Event data is not loaded yet.");
+      return;
+    }
+
     const ad = item.ad || item;
     if (!ad?.id) return;
 
     setSponsoredAdLoading(true);
+
     try {
       const result = await playSponsoredAd(ad.id, eventData.id);
+
       const placement = result.placement || result;
-      const payout =
-        result.earnedAmount ||
-        result.earned_amount ||
+      const estimatedPayoutPerView =
+        result.estimatedPayoutPerView ||
+        result.yourPayout ||
         item.yourPayout ||
         ad.creatorPayoutPro ||
         ad.creatorPayoutFree ||
         0;
+
+      const costPerView =
+        result.costPerView ||
+        item.costPerView ||
+        ad.costPerView ||
+        ad.baseChargePerPlay ||
+        0;
+
       const overlayId = `sponsored-${placement.id || Date.now()}`;
+
       const mediaURL = resolveMediaUrl(
         ad.mediaUrl ||
           ad.media_url ||
@@ -2563,20 +2578,32 @@ export default function Studio() {
           ad.imageUrl ||
           ad.image_url,
       );
+
+      if (!mediaURL) {
+        throw new Error("Ad media URL is missing.");
+      }
+
       const type = ad.type === "image" ? "image" : "ad";
       const element =
         ad.type === "image" ? new Image() : document.createElement("video");
 
       element.crossOrigin = "anonymous";
       element.src = mediaURL;
+
       if (ad.type !== "image") {
         element.muted = true;
         element.playsInline = true;
         element.autoplay = true;
         element.loop = false;
-        element.onended = () =>
+
+        element.onended = () => {
           handleCompleteSponsoredAd(overlayId, placement, ad);
+        };
+
         element.play().catch(() => {});
+      } else {
+        // For image ads, keep it visible until creator manually completes.
+        element.onload = () => {};
       }
 
       mediaElementsRef.current[overlayId] = {
@@ -2589,7 +2616,7 @@ export default function Studio() {
         id: overlayId,
         type,
         title: ad.title || "Sponsored Ad",
-        content: `Payout: NRS ${payout}`,
+        content: `Sponsored • Est. payout/view NRS ${Number(estimatedPayoutPerView || 0).toFixed(2)}`,
         position: "bottom-right",
         duration: ad.durationSeconds || ad.duration_seconds || 0,
         sponsored: true,
@@ -2599,16 +2626,22 @@ export default function Studio() {
         ...prev.filter((o) => o.id !== overlayId),
         overlay,
       ]);
-      setActiveOverlays((prev) => ({ ...prev, [overlayId]: true }));
+
+      setActiveOverlays((prev) => ({
+        ...prev,
+        [overlayId]: true,
+      }));
+
       setCurrentSponsoredAd({
         overlayId,
         placement,
         ad,
-        payout,
+        estimatedPayoutPerView,
+        costPerView,
         startedAt: Date.now(),
       });
     } catch (err) {
-      alert("Failed to play sponsored ad: " + err.message);
+      alert("Failed to play sponsored ad: " + (err.message || err));
     } finally {
       setSponsoredAdLoading(false);
     }
@@ -2621,32 +2654,55 @@ export default function Studio() {
       ad: adArg,
       startedAt: Date.now(),
     };
+
     if (!active?.placement?.id) return;
 
     const watchedSeconds =
       active.ad?.type === "video"
-        ? active.ad.durationSeconds ||
-          active.ad.duration_seconds ||
-          Math.max(1, Math.round((Date.now() - active.startedAt) / 1000))
+        ? Number(
+            active.ad.durationSeconds ||
+              active.ad.duration_seconds ||
+              Math.max(1, Math.round((Date.now() - active.startedAt) / 1000)),
+          )
         : Math.max(1, Math.round((Date.now() - active.startedAt) / 1000));
 
     try {
-      await completeSponsoredAdPlacement(active.placement.id, watchedSeconds);
+      const result = await completeSponsoredAdPlacement(
+        active.placement.id,
+        watchedSeconds,
+      );
+
       setOverlays((prev) => prev.filter((o) => o.id !== active.overlayId));
+
       setActiveOverlays((prev) => {
         const next = { ...prev };
         delete next[active.overlayId];
         return next;
       });
+
       const mediaInfo = mediaElementsRef.current[active.overlayId];
       if (mediaInfo?.element?.pause) mediaInfo.element.pause();
+
       delete mediaElementsRef.current[active.overlayId];
+
       setCurrentSponsoredAd(null);
+
       const market = await getSponsoredAds().catch(() => []);
       setSponsoredAds(Array.isArray(market) ? market : []);
-      alert("Sponsored ad completed. Wallet payout credited.");
+
+      const placement = result?.placement || {};
+      const platformViews =
+        placement.platformViews || placement.platform_views || 0;
+      const earnedAmount =
+        placement.earnedAmount || placement.earned_amount || 0;
+      const chargedAmount =
+        placement.chargedAmount || placement.charged_amount || 0;
+
+      alert(
+        `Sponsored ad completed.\n\nPlatform views: ${platformViews}\nCreator earned: NRS ${Number(earnedAmount).toFixed(2)}\nConsumed spend: NRS ${Number(chargedAmount).toFixed(2)}`,
+      );
     } catch (err) {
-      alert("Failed to complete sponsored ad: " + err.message);
+      alert("Failed to complete sponsored ad: " + (err.message || err));
     }
   };
 
@@ -4557,14 +4613,43 @@ export default function Studio() {
                       <p className="text-sm font-bold text-green-200">
                         Playing: {currentSponsoredAd.ad.title}
                       </p>
-                      <p className="text-xs text-green-100">
-                        Complete after playback to credit creator wallet.
+
+                      <p className="text-xs text-green-100 leading-relaxed">
+                        Complete after playback. Payout will be calculated from
+                        verified Vision Cast platform viewers.
                       </p>
+
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div className="bg-black/20 rounded p-2">
+                          <span className="block text-green-100/70">
+                            Est. payout/view
+                          </span>
+                          <strong className="text-green-100">
+                            NRS{" "}
+                            {Number(
+                              currentSponsoredAd.estimatedPayoutPerView || 0,
+                            ).toFixed(2)}
+                          </strong>
+                        </div>
+
+                        <div className="bg-black/20 rounded p-2">
+                          <span className="block text-green-100/70">
+                            Cost/view
+                          </span>
+                          <strong className="text-green-100">
+                            NRS{" "}
+                            {Number(
+                              currentSponsoredAd.costPerView || 0,
+                            ).toFixed(2)}
+                          </strong>
+                        </div>
+                      </div>
+
                       <button
                         onClick={() => handleCompleteSponsoredAd()}
                         className="w-full bg-green-600 hover:bg-green-700 rounded py-2 text-sm font-bold"
                       >
-                        Complete Sponsored Ad
+                        Complete & Calculate Views
                       </button>
                     </div>
                   )}
@@ -4589,11 +4674,23 @@ export default function Studio() {
                                 {ad.title}
                               </p>
                               <p className="text-xs text-gray-400 capitalize">
-                                {ad.type} • payout NRS{" "}
-                                {item.yourPayout ||
-                                  ad.creatorPayoutPro ||
-                                  ad.creatorPayoutFree ||
-                                  0}
+                                {ad.type} • est. payout/view NRS{" "}
+                                {Number(
+                                  item.yourPayout ||
+                                    item.estimatedPayoutPerView ||
+                                    ad.creatorPayoutPro ||
+                                    ad.creatorPayoutFree ||
+                                    0,
+                                ).toFixed(2)}
+                              </p>
+
+                              <p className="text-xs text-gray-500">
+                                Budget left: NRS{" "}
+                                {Number(ad.remainingBudget || 0).toFixed(2)} •
+                                CPV: NRS{" "}
+                                {Number(
+                                  ad.costPerView || ad.baseChargePerPlay || 0,
+                                ).toFixed(2)}
                               </p>
                             </div>
                             <span className="text-xs bg-gray-700 rounded px-2 py-1">

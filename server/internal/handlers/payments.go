@@ -15,10 +15,16 @@ import (
 
 	"server/internal/config"
 	"server/internal/models"
+	"server/internal/services"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+)
+
+const (
+	paymentPurposeWalletTopup     = "wallet_topup"
+	paymentPurposeSubscriptionPro = "subscription_pro"
 )
 
 type esewaSuccessPayload struct {
@@ -62,74 +68,62 @@ func InitiateEsewaPayment(c *gin.Context) {
 		return
 	}
 
-	wallet, err := getOrCreateWallet(userID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get wallet"})
-		return
-	}
-
-	productCode := config.Env("ESEWA_PRODUCT_CODE", "EPAYTEST")
-	secretKey := config.Env("ESEWA_SECRET_KEY", "")
-	formURL := config.Env("ESEWA_FORM_URL", "https://rc-epay.esewa.com.np/api/epay/main/v2/form")
-	frontendURL := strings.TrimRight(config.Env("FRONTEND_URL", "http://localhost:5173"), "/")
-
-	if secretKey == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "ESEWA_SECRET_KEY is not configured"})
-		return
-	}
-
-	now := time.Now()
-	txUUID := fmt.Sprintf("SA-%d-%d", userID, now.UnixNano())
-	paymentRef := fmt.Sprintf("PAY-%d-%d", userID, now.UnixNano())
-	amount := roundAmount(input.Amount)
-	amountStr := formatEsewaAmount(amount)
-
-	purpose := input.Purpose
+	purpose := strings.TrimSpace(input.Purpose)
 	if purpose == "" {
-		purpose = "wallet_topup"
+		purpose = paymentPurposeWalletTopup
 	}
 
-	intent := models.PaymentIntent{
-		UserID:          userID,
-		WalletID:        wallet.ID,
-		Provider:        "esewa",
-		Purpose:         purpose,
-		PaymentRef:      paymentRef,
-		TransactionUUID: txUUID,
-		Amount:          amount,
-		Currency:        wallet.Currency,
-		Status:          "initiated",
-	}
-
-	if err := db.Create(&intent).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create payment intent"})
+	if purpose != paymentPurposeWalletTopup {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported payment purpose for this endpoint"})
 		return
 	}
 
-	signedFields := "total_amount,transaction_uuid,product_code"
-	message := fmt.Sprintf("total_amount=%s,transaction_uuid=%s,product_code=%s", amountStr, txUUID, productCode)
-	signature := hmacSHA256Base64(message, secretKey)
-
-	fields := gin.H{
-		"amount":                  amountStr,
-		"tax_amount":              "0",
-		"total_amount":            amountStr,
-		"transaction_uuid":        txUUID,
-		"product_code":            productCode,
-		"product_service_charge":  "0",
-		"product_delivery_charge": "0",
-		"success_url":             frontendURL + "/payment/esewa/success",
-		"failure_url":             frontendURL + "/payment/esewa/failure",
-		"signed_field_names":      signedFields,
-		"signature":               signature,
+	payment, err := createEsewaPaymentIntent(c, userID, input.Amount, paymentPurposeWalletTopup)
+	if err != nil {
+		writeEsewaInitiateError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"paymentRef":      paymentRef,
-		"transactionUuid": txUUID,
-		"formUrl":         formURL,
-		"fields":          fields,
-	})
+	c.JSON(http.StatusOK, payment)
+}
+
+func InitiateSubscriptionEsewaPayment(c *gin.Context) {
+	userID, ok := getUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	role, _ := getUserRole(c)
+	if role != "creator" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only creators can buy Pro subscription"})
+		return
+	}
+
+	settings, err := services.GetPlatformSettings(db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load platform settings"})
+		return
+	}
+
+	price := roundAmount(settings.ProSubscriptionPrice)
+	if price < 10 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Pro subscription price must be at least NRS 10"})
+		return
+	}
+
+	payment, err := createEsewaPaymentIntent(c, userID, price, paymentPurposeSubscriptionPro)
+	if err != nil {
+		writeEsewaInitiateError(c, err)
+		return
+	}
+
+	payment["purpose"] = paymentPurposeSubscriptionPro
+	payment["amount"] = price
+	payment["currency"] = settings.Currency
+	payment["billingPeriod"] = "month"
+
+	c.JSON(http.StatusOK, payment)
 }
 
 func VerifyEsewaPayment(c *gin.Context) {
@@ -186,7 +180,7 @@ func VerifyEsewaPayment(c *gin.Context) {
 
 	if intent.Status == "complete" {
 		c.JSON(http.StatusOK, gin.H{
-			"message": "Payment already verified",
+			"message": messageForCompletedPurpose(intent.Purpose),
 			"payment": intent,
 		})
 		return
@@ -229,6 +223,7 @@ func VerifyEsewaPayment(c *gin.Context) {
 	}
 
 	now := time.Now()
+	var subscriptionExpiresAt *time.Time
 
 	err = db.Transaction(func(tx *gorm.DB) error {
 		var locked models.PaymentIntent
@@ -244,16 +239,48 @@ func VerifyEsewaPayment(c *gin.Context) {
 			return nil
 		}
 
-		if err := creditWalletWithDB(
-			tx,
-			locked.WalletID,
-			locked.Amount,
-			"deposit",
-			"eSewa wallet top-up",
-			"payment_intent",
-			locked.ID,
-		); err != nil {
-			return err
+		switch locked.Purpose {
+		case paymentPurposeSubscriptionPro:
+			expiresAt, err := activateProSubscriptionWithDB(tx, locked.UserID, now)
+			if err != nil {
+				return err
+			}
+			subscriptionExpiresAt = &expiresAt
+
+			var adminUser models.User
+			if err := tx.Where("role = ?", "admin").First(&adminUser).Error; err == nil {
+				adminWallet, err := getOrCreateWalletWithDB(tx, adminUser.ID)
+				if err != nil {
+					return err
+				}
+				if err := creditWalletWithDB(
+					tx,
+					adminWallet.ID,
+					locked.Amount,
+					"subscription",
+					"Creator Pro subscription direct payment",
+					"payment_intent",
+					locked.ID,
+				); err != nil {
+					return err
+				}
+			}
+
+		case paymentPurposeWalletTopup:
+			if err := creditWalletWithDB(
+				tx,
+				locked.WalletID,
+				locked.Amount,
+				"deposit",
+				"eSewa wallet top-up",
+				"payment_intent",
+				locked.ID,
+			); err != nil {
+				return err
+			}
+
+		default:
+			return fmt.Errorf("unsupported payment purpose: %s", locked.Purpose)
 		}
 
 		updates := map[string]interface{}{
@@ -271,14 +298,23 @@ func VerifyEsewaPayment(c *gin.Context) {
 	})
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to credit wallet"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to finalize payment"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Payment verified and wallet credited",
+	response := gin.H{
+		"message": messageForCompletedPurpose(intent.Purpose),
 		"payment": intent,
-	})
+	}
+	if subscriptionExpiresAt != nil {
+		response["subscription"] = gin.H{
+			"plan":      "pro",
+			"status":    "active",
+			"expiresAt": subscriptionExpiresAt,
+		}
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func GetPaymentStatus(c *gin.Context) {
@@ -297,6 +333,101 @@ func GetPaymentStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"payment": intent})
+}
+
+func createEsewaPaymentIntent(c *gin.Context, userID uint, amount float64, purpose string) (gin.H, error) {
+	wallet, err := getOrCreateWallet(userID)
+	if err != nil {
+		return nil, fmt.Errorf("wallet: %w", err)
+	}
+
+	productCode := config.Env("ESEWA_PRODUCT_CODE", "EPAYTEST")
+	secretKey := config.Env("ESEWA_SECRET_KEY", "")
+	formURL := config.Env("ESEWA_FORM_URL", "https://rc-epay.esewa.com.np/api/epay/main/v2/form")
+	frontendURL := strings.TrimRight(config.Env("FRONTEND_URL", "http://localhost:5173"), "/")
+
+	if secretKey == "" {
+		return nil, fmt.Errorf("missing_esewa_secret")
+	}
+
+	now := time.Now()
+	txUUID := fmt.Sprintf("SA-%d-%d", userID, now.UnixNano())
+	paymentRef := fmt.Sprintf("PAY-%d-%d", userID, now.UnixNano())
+	roundedAmount := roundAmount(amount)
+	amountStr := formatEsewaAmount(roundedAmount)
+
+	intent := models.PaymentIntent{
+		UserID:          userID,
+		WalletID:        wallet.ID,
+		Provider:        "esewa",
+		Purpose:         purpose,
+		PaymentRef:      paymentRef,
+		TransactionUUID: txUUID,
+		Amount:          roundedAmount,
+		Currency:        wallet.Currency,
+		Status:          "initiated",
+	}
+
+	if err := db.Create(&intent).Error; err != nil {
+		return nil, fmt.Errorf("create_intent: %w", err)
+	}
+
+	signedFields := "total_amount,transaction_uuid,product_code"
+	message := fmt.Sprintf("total_amount=%s,transaction_uuid=%s,product_code=%s", amountStr, txUUID, productCode)
+	signature := hmacSHA256Base64(message, secretKey)
+
+	fields := gin.H{
+		"amount":                  amountStr,
+		"tax_amount":              "0",
+		"total_amount":            amountStr,
+		"transaction_uuid":        txUUID,
+		"product_code":            productCode,
+		"product_service_charge":  "0",
+		"product_delivery_charge": "0",
+		"success_url":             frontendURL + "/payment/esewa/success",
+		"failure_url":             frontendURL + "/payment/esewa/failure",
+		"signed_field_names":      signedFields,
+		"signature":               signature,
+	}
+
+	return gin.H{
+		"paymentRef":      paymentRef,
+		"transactionUuid": txUUID,
+		"formUrl":         formURL,
+		"fields":          fields,
+	}, nil
+}
+
+func writeEsewaInitiateError(c *gin.Context, err error) {
+	msg := err.Error()
+
+	if strings.Contains(msg, "missing_esewa_secret") {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "ESEWA_SECRET_KEY is not configured"})
+		return
+	}
+
+	if strings.Contains(msg, "wallet:") {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get wallet"})
+		return
+	}
+
+	if strings.Contains(msg, "create_intent:") {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create payment intent"})
+		return
+	}
+
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate eSewa payment"})
+}
+
+func messageForCompletedPurpose(purpose string) string {
+	switch purpose {
+	case paymentPurposeSubscriptionPro:
+		return "Payment verified and Pro subscription activated"
+	case paymentPurposeWalletTopup:
+		return "Payment verified and wallet credited"
+	default:
+		return "Payment verified"
+	}
 }
 
 func verifyEsewaResponseSignature(payload esewaSuccessPayload, secret string) bool {

@@ -64,6 +64,7 @@ func main() {
 
 	r.POST("/api/register", handlers.Register(db))
 	r.POST("/api/login", handlers.Login(db))
+	r.GET("/api/public/pricing", handlers.GetPublicPricing)
 	r.GET("/api/events/code/:code", handlers.GetPublicEvent(db))
 
 	api := r.Group("/api")
@@ -97,6 +98,7 @@ func main() {
 
 		api.GET("/subscription", handlers.GetSubscription)
 		api.POST("/subscription/upgrade", handlers.UpgradeSubscription)
+		api.POST("/subscription/checkout/esewa", handlers.InitiateSubscriptionEsewaPayment)
 
 		api.GET("/ads/marketplace", handlers.GetAdMarketplace)
 		api.POST("/ads/play", handlers.PlayAd)

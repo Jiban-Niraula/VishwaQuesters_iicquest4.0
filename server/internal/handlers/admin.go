@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func AdminListUsers(c *gin.Context) {
@@ -75,53 +76,63 @@ func AdminUpdateAdStatus(c *gin.Context) {
 		Status string `json:"status" binding:"required,oneof=approved rejected"`
 		Reason string `json:"reason"`
 	}
+
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	var updatedAd models.Ad
+
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var ad models.Ad
-		if err := tx.First(&ad, adID).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&ad, adID).Error; err != nil {
 			return err
 		}
+
 		if ad.Status == "completed" {
 			return errors.New("completed campaign status cannot be changed")
 		}
+
 		if ad.Status == input.Status {
 			updatedAd = ad
 			return nil
 		}
+
 		if ad.Status == "rejected" {
 			return errors.New("rejected campaign cannot be changed")
 		}
 
 		if input.Status == "rejected" {
-			companyWallet, err := getOrCreateWalletWithDB(tx, ad.CompanyID)
-			if err != nil {
-				return err
-			}
-			if err := creditWalletWithDB(tx, companyWallet.ID, ad.ChargeAmount, "refund", "Refund: ad rejected #"+fmt.Sprint(ad.ID), "Ad", ad.ID); err != nil {
-				return err
-			}
-
-			var adminUser models.User
-			if err := tx.Where("role = ?", "admin").First(&adminUser).Error; err == nil {
-				adminWallet, err := getOrCreateWalletWithDB(tx, adminUser.ID)
+			refundAmount := ad.RemainingBudget
+			if refundAmount > 0 {
+				companyWallet, err := getOrCreateWalletWithDB(tx, ad.CompanyID)
 				if err != nil {
 					return err
 				}
-				if err := debitWalletWithDB(tx, adminWallet.ID, ad.AdminCommission, "charge", "Commission reversal: ad rejected #"+fmt.Sprint(ad.ID), "Ad", ad.ID); err != nil {
+
+				if err := creditWalletWithDB(
+					tx,
+					companyWallet.ID,
+					refundAmount,
+					"refund",
+					"Refund unused ad campaign budget #"+fmt.Sprint(ad.ID),
+					"Ad",
+					ad.ID,
+				); err != nil {
 					return err
 				}
 			}
+
+			ad.RemainingBudget = 0
 		}
 
 		ad.Status = input.Status
+
 		if err := tx.Save(&ad).Error; err != nil {
 			return err
 		}
+
 		updatedAd = ad
 		return nil
 	})
@@ -131,10 +142,7 @@ func AdminUpdateAdStatus(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Ad not found"})
 			return
 		}
-		if errors.Is(err, ErrInsufficientBalance) {
-			c.JSON(http.StatusConflict, gin.H{"error": "Admin wallet does not have enough balance to reverse commission"})
-			return
-		}
+
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

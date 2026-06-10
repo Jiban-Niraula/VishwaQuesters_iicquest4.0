@@ -80,6 +80,30 @@ func (r *Room) CameraCount() int {
 	}
 	return count
 }
+func (r *Room) RoleCount(role string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	count := 0
+	for _, client := range r.Clients {
+		if client.Role == role {
+			count++
+		}
+	}
+	return count
+}
+
+func CountViewers(roomCode string) int {
+	GlobalHub.mu.RLock()
+	room := GlobalHub.Rooms[roomCode]
+	GlobalHub.mu.RUnlock()
+
+	if room == nil {
+		return 0
+	}
+
+	return room.RoleCount("viewer")
+}
 
 func (r *Room) BroadcastToOthers(senderID string, message []byte) {
 	r.mu.RLock()

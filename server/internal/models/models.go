@@ -104,7 +104,8 @@ type StreamDestination struct {
 }
 
 type Ad struct {
-	ID        uint  `gorm:"primaryKey" json:"id"`
+	ID uint `gorm:"primaryKey" json:"id"`
+
 	CompanyID uint  `gorm:"index;not null" json:"companyId"`
 	Company   *User `gorm:"foreignKey:CompanyID" json:"company,omitempty"`
 
@@ -116,15 +117,35 @@ type Ad struct {
 
 	Status string `gorm:"not null;default:'pending'" json:"status"` // pending | approved | rejected | completed
 
-	BaseChargePerPlay float64 `gorm:"not null;default:0" json:"baseChargePerPlay"`
-	ChargeAmount      float64 `gorm:"not null;default:0" json:"chargeAmount"`
-	AdminCommission   float64 `gorm:"not null;default:0" json:"adminCommission"`
-	CreatorPayoutPro  float64 `gorm:"not null;default:0" json:"creatorPayoutPro"`
-	CreatorPayoutFree float64 `gorm:"not null;default:0" json:"creatorPayoutFree"`
+	// Pricing model:
+	// CampaignBudget is the amount company reserves.
+	// RemainingBudget is unspent budget.
+	// SpentAmount is actual consumed budget from billable platform views.
+	CampaignBudget float64 `gorm:"not null;default:0" json:"campaignBudget"`
+	ChargeAmount   float64 `gorm:"not null;default:0" json:"chargeAmount"` // kept for old UI/backward compatibility
+	SpentAmount    float64 `gorm:"not null;default:0" json:"spentAmount"`
 
-	MaxPlays        int     `gorm:"not null;default:1" json:"maxPlays"`
+	// CostPerView is the actual billable rate for Vision Cast platform views.
+	// BaseChargePerPlay is kept for backward compatibility and mirrors CostPerView.
+	CostPerView       float64 `gorm:"not null;default:0" json:"costPerView"`
+	BaseChargePerPlay float64 `gorm:"not null;default:0" json:"baseChargePerPlay"`
+
+	// Running totals earned by platform/admin/creators.
+	AdminCommission   float64 `gorm:"not null;default:0" json:"adminCommission"`
+	CreatorPayoutPro  float64 `gorm:"not null;default:0" json:"creatorPayoutPro"`  // pro payout per view
+	CreatorPayoutFree float64 `gorm:"not null;default:0" json:"creatorPayoutFree"` // free payout per view
+
+	MaxPlays        int     `gorm:"not null;default:1000000" json:"maxPlays"` // safety cap only
 	CompletedPlays  int     `gorm:"not null;default:0" json:"completedPlays"`
 	RemainingBudget float64 `gorm:"not null;default:0" json:"remainingBudget"`
+
+	EstimatedViews int `gorm:"not null;default:0" json:"estimatedViews"`
+
+	// Analytics totals
+	PlatformViews int `gorm:"not null;default:0" json:"platformViews"`
+	YoutubeViews  int `gorm:"not null;default:0" json:"youtubeViews"`
+	FacebookViews int `gorm:"not null;default:0" json:"facebookViews"`
+	TotalViews    int `gorm:"not null;default:0" json:"totalViews"`
 
 	AdPlacements []AdPlacement `gorm:"foreignKey:AdID" json:"adPlacements,omitempty"`
 
@@ -146,9 +167,21 @@ type AdPlacement struct {
 
 	Status string `gorm:"not null;default:'playing'" json:"status"` // playing | completed | cancelled
 
-	EarnedAmount   float64 `gorm:"not null;default:0" json:"earnedAmount"`
 	CreatorTier    string  `gorm:"not null" json:"creatorTier"` // free | pro
 	WatchedSeconds int     `gorm:"default:0" json:"watchedSeconds"`
+	EarnedAmount   float64 `gorm:"not null;default:0" json:"earnedAmount"`
+
+	// Analytics for this placement
+	PlatformViews int `gorm:"not null;default:0" json:"platformViews"`
+	YoutubeViews  int `gorm:"not null;default:0" json:"youtubeViews"`
+	FacebookViews int `gorm:"not null;default:0" json:"facebookViews"`
+	TotalViews    int `gorm:"not null;default:0" json:"totalViews"`
+
+	// Money split for this placement
+	ChargedAmount     float64 `gorm:"not null;default:0" json:"chargedAmount"`
+	AdminCommission   float64 `gorm:"not null;default:0" json:"adminCommission"`
+	CreatorPayout     float64 `gorm:"not null;default:0" json:"creatorPayout"`
+	FreeTierRemainder float64 `gorm:"not null;default:0" json:"freeTierRemainder"`
 
 	PlayedAt    *time.Time `json:"playedAt,omitempty"`
 	CompletedAt *time.Time `json:"completedAt,omitempty"`

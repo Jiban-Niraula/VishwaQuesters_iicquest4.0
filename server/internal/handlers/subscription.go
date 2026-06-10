@@ -24,14 +24,25 @@ func GetSubscription(c *gin.Context) {
 		return
 	}
 
+	settings, err := services.GetPlatformSettings(db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load platform settings"})
+		return
+	}
+
 	plan := services.GetCreatorPlan(db, userID)
 	c.JSON(http.StatusOK, gin.H{
-		"plan":         plan,
-		"status":       sub.Status,
-		"startedAt":    sub.StartedAt,
-		"expiresAt":    sub.ExpiresAt,
-		"maxCameras":   services.MaxCamerasForPlan(db, plan),
-		"canUploadAds": plan == "pro",
+		"plan":              plan,
+		"status":            sub.Status,
+		"startedAt":         sub.StartedAt,
+		"expiresAt":         sub.ExpiresAt,
+		"maxCameras":        services.MaxCamerasForPlan(db, plan),
+		"canUploadAds":      plan == "pro",
+		"currency":          settings.Currency,
+		"proPrice":          settings.ProSubscriptionPrice,
+		"billingPeriod":     "month",
+		"walletUpgradePath": "/api/subscription/upgrade",
+		"directPaymentPath": "/api/subscription/checkout/esewa",
 	})
 }
 
@@ -67,15 +78,20 @@ func UpgradeSubscription(c *gin.Context) {
 
 	price := settings.ProSubscriptionPrice
 	if wallet.Balance < price {
-		c.JSON(http.StatusPaymentRequired, gin.H{"error": "Insufficient wallet balance", "required": price, "currentBalance": wallet.Balance, "currency": wallet.Currency})
+		c.JSON(http.StatusPaymentRequired, gin.H{
+			"error":          "Insufficient wallet balance",
+			"required":       price,
+			"currentBalance": wallet.Balance,
+			"currency":       wallet.Currency,
+		})
 		return
 	}
 
 	now := time.Now()
-	expiresAt := now.AddDate(0, 1, 0)
+	var expiresAt time.Time
 
 	err = db.Transaction(func(tx *gorm.DB) error {
-		if err := debitWalletWithDB(tx, wallet.ID, price, "subscription", "Pro subscription upgrade", "Subscription", 0); err != nil {
+		if err := debitWalletWithDB(tx, wallet.ID, price, "subscription", "Pro subscription upgrade from wallet", "Subscription", 0); err != nil {
 			return err
 		}
 
@@ -85,23 +101,14 @@ func UpgradeSubscription(c *gin.Context) {
 			if err != nil {
 				return err
 			}
-			if err := creditWalletWithDB(tx, adminWallet.ID, price, "subscription", "Creator Pro subscription", "Subscription", 0); err != nil {
+			if err := creditWalletWithDB(tx, adminWallet.ID, price, "subscription", "Creator Pro subscription from wallet", "Subscription", 0); err != nil {
 				return err
 			}
 		}
 
-		var sub models.Subscription
-		err := tx.Where("user_id = ?", userID).First(&sub).Error
-		if err == gorm.ErrRecordNotFound {
-			sub = models.Subscription{UserID: userID}
-		} else if err != nil {
-			return err
-		}
-		sub.Plan = "pro"
-		sub.Status = "active"
-		sub.StartedAt = now
-		sub.ExpiresAt = &expiresAt
-		return tx.Save(&sub).Error
+		var activateErr error
+		expiresAt, activateErr = activateProSubscriptionWithDB(tx, userID, now)
+		return activateErr
 	})
 
 	if err != nil {
@@ -109,5 +116,41 @@ func UpgradeSubscription(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Upgraded to Pro successfully", "plan": "pro", "status": "active", "startedAt": now, "expiresAt": expiresAt, "maxCameras": -1})
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "Upgraded to Pro successfully",
+		"plan":       "pro",
+		"status":     "active",
+		"startedAt":  now,
+		"expiresAt":  expiresAt,
+		"maxCameras": -1,
+		"price":      price,
+		"currency":   settings.Currency,
+	})
+}
+
+func activateProSubscriptionWithDB(tx *gorm.DB, userID uint, startedAt time.Time) (time.Time, error) {
+	expiresAt := startedAt.AddDate(0, 1, 0)
+
+	var existing models.Subscription
+	err := tx.Where("user_id = ?", userID).First(&existing).Error
+	if err == gorm.ErrRecordNotFound {
+		existing = models.Subscription{UserID: userID}
+	} else if err != nil {
+		return time.Time{}, err
+	}
+
+	if existing.Plan == "pro" && existing.Status == "active" && existing.ExpiresAt != nil && existing.ExpiresAt.After(startedAt) {
+		expiresAt = existing.ExpiresAt.AddDate(0, 1, 0)
+	}
+
+	existing.Plan = "pro"
+	existing.Status = "active"
+	existing.StartedAt = startedAt
+	existing.ExpiresAt = &expiresAt
+
+	if err := tx.Save(&existing).Error; err != nil {
+		return time.Time{}, err
+	}
+
+	return expiresAt, nil
 }

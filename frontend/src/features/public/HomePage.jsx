@@ -1,5 +1,8 @@
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import PublicLayout from '../../shared/layout/PublicLayout.jsx';
+import { publicApi } from '../../shared/api/public.js';
+import { money } from '../../shared/utils/format.js';
 
 const features = [
   {
@@ -25,6 +28,39 @@ const features = [
 ];
 
 export default function HomePage() {
+  const [pricing, setPricing] = useState({
+    currency: 'NRS',
+    proSubscriptionPrice: 999,
+    freeCameraLimit: 4,
+    billingPeriod: 'month',
+  });
+
+  useEffect(() => {
+    let mounted = true;
+
+    publicApi.pricing()
+      .then((data) => {
+        if (!mounted) return;
+        setPricing({
+          currency: data.currency || 'NRS',
+          proSubscriptionPrice: Number(data.proSubscriptionPrice ?? 999),
+          freeCameraLimit: Number(data.freeCameraLimit ?? 4),
+          billingPeriod: data.billingPeriod || 'month',
+        });
+      })
+      .catch(() => {
+        // Keep fallback pricing if public pricing API is unavailable.
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const proPriceText = useMemo(() => {
+    return `${money(pricing.proSubscriptionPrice, pricing.currency)} / ${pricing.billingPeriod}`;
+  }, [pricing]);
+
   return (
     <PublicLayout>
       <div className="vc-landing">
@@ -103,7 +139,7 @@ export default function HomePage() {
 
         <section className="vc-stats">
           <div>
-            <strong>4+</strong>
+            <strong>{pricing.freeCameraLimit}+</strong>
             <span>Free cameras</span>
           </div>
           <div>
@@ -111,7 +147,7 @@ export default function HomePage() {
             <span>Live publishing</span>
           </div>
           <div>
-            <strong>NRS</strong>
+            <strong>{pricing.currency}</strong>
             <span>Wallet earnings</span>
           </div>
         </section>
@@ -177,17 +213,22 @@ export default function HomePage() {
           <div className="vc-section-head center">
             <span>Plans</span>
             <h2>Start simple. Upgrade when production grows.</h2>
+            <p>
+              Start with the free plan, then buy Pro directly when you need
+              unlimited cameras and full creator tools.
+            </p>
           </div>
 
           <div className="vc-plan-grid">
             <article className="vc-plan-card">
               <h3>Free</h3>
               <p>For creators starting with simple multi-camera streams.</p>
-              <strong>NRS 0</strong>
+              <strong>NRS 0 / forever</strong>
+
               <ul>
                 <li>
                   <i className="fa-solid fa-check" />
-                  Up to 4 cameras
+                  Up to {pricing.freeCameraLimit} cameras
                 </li>
                 <li>
                   <i className="fa-solid fa-check" />
@@ -198,12 +239,17 @@ export default function HomePage() {
                   Basic studio tools
                 </li>
               </ul>
+
+              <Link className="btn btn-secondary" to="/register">
+                Start Free
+              </Link>
             </article>
 
             <article className="vc-plan-card featured">
               <h3>Pro</h3>
               <p>For creators who need unlimited cameras and own ad uploads.</p>
-              <strong>Admin priced</strong>
+              <strong>{proPriceText}</strong>
+
               <ul>
                 <li>
                   <i className="fa-solid fa-check" />
@@ -217,7 +263,16 @@ export default function HomePage() {
                   <i className="fa-solid fa-check" />
                   Higher sponsored ad payout
                 </li>
+                <li>
+                  <i className="fa-solid fa-check" />
+                  Direct monthly subscription payment
+                </li>
               </ul>
+
+              <Link className="btn btn-primary" to="/register">
+                Create account to buy Pro
+                <i className="fa-solid fa-arrow-right" />
+              </Link>
             </article>
           </div>
         </section>
@@ -252,6 +307,15 @@ export default function HomePage() {
                 Facebook, Twitch, and custom RTMP servers.
               </p>
             </details>
+
+            <details>
+              <summary>Can I buy Pro without depositing to wallet?</summary>
+              <p>
+                Yes. Pro can be purchased directly through the subscription page.
+                Wallet deposit is optional and mainly used for ad campaigns,
+                payouts, and wallet-based actions.
+              </p>
+            </details>
           </div>
         </section>
 
@@ -270,4 +334,4 @@ export default function HomePage() {
       </div>
     </PublicLayout>
   );
-} 
+}
