@@ -201,6 +201,27 @@ func (r *RTMPStreamer) monitorFFmpeg(destinationID uint, cmd *exec.Cmd) {
 	}
 }
 
+func (r *RTMPStreamer) WriteChunkToDestination(destinationID uint, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	r.mu.RLock()
+	input, exists := r.inputs[destinationID]
+	r.mu.RUnlock()
+
+	if !exists {
+		log.Printf("[RTMP] No active stream input for destination %d; dropping %d-byte chunk", destinationID, len(data))
+		return nil
+	}
+
+	_, err := input.Write(data)
+	if err != nil {
+		log.Printf("[RTMP] Error writing to destination %d: %v", destinationID, err)
+	}
+	return err
+}
+
 func (r *RTMPStreamer) WriteChunk(data []byte) error {
 	if len(data) == 0 {
 		return nil
