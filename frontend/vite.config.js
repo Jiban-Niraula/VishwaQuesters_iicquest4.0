@@ -7,24 +7,24 @@ export default defineConfig({
 
   server: {
     host: '0.0.0.0',
-    port: 5173,
+    port: 2059,
 
     allowedHosts: [
-      '8d8f-202-63-244-120.ngrok-free.app'
+      'backend.iic.utsav56.me',
     ],
 
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'https://backend.iic.utsav56.me',
         changeOrigin: true,
         ws: true
       },
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: 'ws://backend.iic.utsav56.me',
         ws: true
       },
       '/uploads': {
-        target: 'http://localhost:8080',
+        target: 'https://backend.iic.utsav56.me',
         changeOrigin: true
       }
     }
