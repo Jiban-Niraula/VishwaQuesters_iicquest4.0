@@ -57,8 +57,14 @@ const PLATFORM_OPTIONS = [
 
 function buildIceServers() {
   const iceServers = [
+    // ✅ FIX: Multiple STUN servers for redundancy
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
+    // ✅ FIX: Additional fallback STUN
+    { urls: "stun:global.stun.twilio.com:3478" },
   ];
 
   const turnUrlsRaw =
@@ -85,6 +91,9 @@ function buildIceServers() {
     iceCandidatePoolSize: 10,
     iceTransportPolicy:
       import.meta.env.VITE_FORCE_TURN === "true" ? "relay" : "all",
+    // ✅ FIX: Better policies for multi-peer connections
+    bundlePolicy: "max-bundle",
+    rtcpMuxPolicy: "require",
   };
 }
 
@@ -1256,12 +1265,22 @@ export default function Studio() {
         return;
       }
 
-      // If the same camera reconnects, clean old connection first.
-      if (peerConnectionsRef.current[cameraID]) {
+      // ✅ FIX: If we already have a stable connection with this camera, skip duplicate offers
+      const existingPc = peerConnectionsRef.current[cameraID];
+      if (existingPc) {
+        const existingState = existingPc.connectionState;
+        if (existingState === "connected" || existingState === "connecting") {
+          console.log(
+            `Camera ${cameraID} already ${existingState}. Skipping duplicate offer.`,
+          );
+          return;
+        }
+        // Connection exists but is in bad state — clean it up
         try {
-          peerConnectionsRef.current[cameraID].close();
+          existingPc.close();
         } catch {}
         delete peerConnectionsRef.current[cameraID];
+        delete iceCandidateQueuesRef.current[cameraID];
       }
 
       let video = cameraVideosRef.current[cameraID];
@@ -1328,15 +1347,19 @@ export default function Studio() {
       peerConnectionsRef.current[cameraID] = pc;
       iceCandidateQueuesRef.current[cameraID] = [];
 
+      // ✅ FIX: Suppress noisy ICE 701 errors (IPv6 STUN lookup — expected)
       pc.onicecandidateerror = (event) => {
-        console.error("[ICE ERROR]", {
-          url: event.url,
-          errorCode: event.errorCode,
-          errorText: event.errorText,
-          address: event.address,
-          port: event.port,
-        });
+        if (event.errorCode !== 701) {
+          console.error("[ICE ERROR]", {
+            url: event.url,
+            errorCode: event.errorCode,
+            errorText: event.errorText,
+            address: event.address,
+            port: event.port,
+          });
+        }
       };
+
       const connectAudioTrackToMixer = (audioTrack) => {
         if (!audioContextRef.current) {
           const AudioContextClass =
@@ -1434,7 +1457,9 @@ export default function Studio() {
         tryPlayVideo();
       };
 
+      // ✅ FIX: Proper disconnect/failure handling with ICE restart
       let disconnectTimer = null;
+      let iceRestartAttempted = false;
 
       pc.onconnectionstatechange = () => {
         console.log(`Camera ${cameraID} connectionState:`, pc.connectionState);
@@ -1444,26 +1469,56 @@ export default function Studio() {
             clearTimeout(disconnectTimer);
             disconnectTimer = null;
           }
+          iceRestartAttempted = false; // Reset on successful connection
           return;
         }
 
         if (pc.connectionState === "disconnected") {
           if (disconnectTimer) clearTimeout(disconnectTimer);
 
+          // ✅ FIX: Try ICE restart first, only request new offer if that fails
           disconnectTimer = setTimeout(() => {
             const currentPc = peerConnectionsRef.current[cameraID];
 
             if (
               currentPc &&
-              currentPc.connectionState !== "connected" &&
-              currentPc.connectionState !== "connecting"
+              currentPc === pc &&
+              currentPc.connectionState === "disconnected"
             ) {
-              console.warn(
-                `Camera ${cameraID} still disconnected. Requesting new offer.`,
-              );
-              send("request_offer", {}, cameraID);
+              if (!iceRestartAttempted) {
+                console.warn(
+                  `Camera ${cameraID} still disconnected. Attempting ICE restart...`,
+                );
+                iceRestartAttempted = true;
+                try {
+                  currentPc.restartIce();
+                } catch (err) {
+                  console.warn(`ICE restart failed for ${cameraID}:`, err);
+                }
+
+                // Wait another 10s after ICE restart before requesting new offer
+                disconnectTimer = setTimeout(() => {
+                  const retryPc = peerConnectionsRef.current[cameraID];
+                  if (
+                    retryPc &&
+                    retryPc === pc &&
+                    retryPc.connectionState !== "connected" &&
+                    retryPc.connectionState !== "connecting"
+                  ) {
+                    console.warn(
+                      `Camera ${cameraID} still not connected after ICE restart. Requesting new offer.`,
+                    );
+                    send("request_offer", {}, cameraID);
+                  }
+                }, 10000);
+              } else {
+                console.warn(
+                  `Camera ${cameraID} still disconnected after ICE restart. Requesting new offer.`,
+                );
+                send("request_offer", {}, cameraID);
+              }
             }
-          }, 8000);
+          }, 5000); // ✅ FIX: Reduced from 8000ms to 5000ms — faster recovery
 
           return;
         }
@@ -1472,7 +1527,13 @@ export default function Studio() {
           pc.connectionState === "failed" ||
           pc.connectionState === "closed"
         ) {
-          console.warn(`Camera ${cameraID} failed/closed. Removing camera.`);
+          console.warn(`Camera ${cameraID} failed/closed. Cleaning up.`);
+
+          if (disconnectTimer) {
+            clearTimeout(disconnectTimer);
+            disconnectTimer = null;
+          }
+
           try {
             pc.close();
           } catch {}
@@ -1480,20 +1541,46 @@ export default function Studio() {
           delete peerConnectionsRef.current[cameraID];
           delete iceCandidateQueuesRef.current[cameraID];
 
+          // ✅ FIX: Clean up audio source for this camera
+          const audioSource = audioSourcesRef.current[cameraID];
+          if (audioSource) {
+            try {
+              audioSource.sourceNode.disconnect();
+            } catch {}
+            try {
+              audioSource.gainNode.disconnect();
+            } catch {}
+            delete audioSourcesRef.current[cameraID];
+          }
+
           setCameras((prev) => {
             const next = { ...prev };
             delete next[cameraID];
             return next;
           });
 
+          // ✅ FIX: Only request new offer — don't immediately create a new peer connection
+          // The camera will handle sending a new offer when it receives request_offer
           send("request_offer", {}, cameraID);
         }
       };
+
+      // ✅ FIX: Add ICE connection state monitoring
       pc.oniceconnectionstatechange = () => {
-        console.log(
-          `Camera ${cameraID} iceConnectionState:`,
-          pc.iceConnectionState,
-        );
+        const iceState = pc.iceConnectionState;
+        console.log(`Camera ${cameraID} iceConnectionState:`, iceState);
+
+        // ✅ FIX: Try ICE restart on ICE failure
+        if (iceState === "failed") {
+          console.warn(
+            `Camera ${cameraID} ICE failed. Attempting restartIce()...`,
+          );
+          try {
+            pc.restartIce();
+          } catch (err) {
+            console.warn(`restartIce() failed for ${cameraID}:`, err);
+          }
+        }
       };
 
       pc.onicecandidate = (event) => {
@@ -1505,6 +1592,7 @@ export default function Studio() {
           console.log("[ICE CANDIDATE]", {
             type,
             protocol,
+            camera: cameraID,
             candidate: raw,
           });
 
@@ -1620,10 +1708,16 @@ export default function Studio() {
 
         console.log(`📷 Camera joined: ${cameraID}`);
 
-        // Ask camera to resend offer if needed.
-        // This fixes cases where the phone joined but Studio missed the first offer.
+        // ✅ FIX: Only request offer if we don't already have a connection
+        // This prevents duplicate peer connections for the same camera
         setTimeout(() => {
-          if (!peerConnectionsRef.current[cameraID]) {
+          const existingPc = peerConnectionsRef.current[cameraID];
+          if (
+            !existingPc ||
+            (existingPc.connectionState !== "connected" &&
+              existingPc.connectionState !== "connecting")
+          ) {
+            console.log(`📷 Requesting offer from camera ${cameraID}`);
             send(
               "request_offer",
               {
@@ -1632,8 +1726,12 @@ export default function Studio() {
               },
               cameraID,
             );
+          } else {
+            console.log(
+              `📷 Camera ${cameraID} already connected, skipping request_offer`,
+            );
           }
-        }, 500);
+        }, 1000); // ✅ FIX: Increased from 500ms to 1000ms — give camera time to send its own offer first
       }
     },
     [send, eventCode],

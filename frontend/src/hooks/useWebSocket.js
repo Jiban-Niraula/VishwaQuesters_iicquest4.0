@@ -29,6 +29,7 @@ export default function useWebSocket(
   const messageQueueRef = useRef([]);
   const reconnectTimeoutRef = useRef(null);
   const clientIdRef = useRef("");
+  const mountedRef = useRef(false); // ✅ FIX: Track real mount state to prevent StrictMode double-close
 
   const [isConnected, setIsConnected] = useState(false);
   const [clientID, setClientID] = useState("");
@@ -80,13 +81,17 @@ export default function useWebSocket(
     if (!sessionCode) return;
 
     let shouldReconnect = true;
+    mountedRef.current = true; // ✅ Mark as truly mounted
 
     const id = generateID();
     clientIdRef.current = id;
     setClientID(id);
 
+    let reconnectAttempt = 0;
+    const MAX_RECONNECT_ATTEMPTS = 10;
+
     const connect = () => {
-      if (!shouldReconnect) return;
+      if (!shouldReconnect || !mountedRef.current) return; // ✅ Check mount state
 
       const wsUrl = `${WS_BASE}/ws?code=${encodeURIComponent(sessionCode)}`;
       const ws = new WebSocket(wsUrl);
@@ -94,7 +99,13 @@ export default function useWebSocket(
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (!mountedRef.current) {
+          // ✅ Guard: don't act if unmounted
+          ws.close();
+          return;
+        }
         console.log(`[WS] Connected as ${role} to room ${sessionCode}`);
+        reconnectAttempt = 0; // ✅ Reset reconnect counter on success
         setIsConnected(true);
 
         ws.send(
@@ -135,32 +146,58 @@ export default function useWebSocket(
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        if (!mountedRef.current) return; // ✅ Don't reconnect if unmounted
         setIsConnected(false);
 
         if (!shouldReconnect) return;
 
-        console.log("[WS] Disconnected, reconnecting in 3s...");
-        reconnectTimeoutRef.current = setTimeout(connect, 3000);
+        reconnectAttempt++;
+        if (reconnectAttempt > MAX_RECONNECT_ATTEMPTS) {
+          console.error(
+            `[WS] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Stopping.`,
+          );
+          return;
+        }
+
+        // ✅ Exponential backoff: 2s, 4s, 8s, 16s, capped at 16s
+        const delay = Math.min(2000 * Math.pow(2, reconnectAttempt - 1), 16000);
+        console.log(
+          `[WS] Disconnected (code=${event.code}), reconnecting in ${delay}ms... (attempt ${reconnectAttempt})`,
+        );
+        reconnectTimeoutRef.current = setTimeout(connect, delay);
       };
 
       ws.onerror = (err) => {
         console.error("[WS] Error:", err);
-        ws.close();
+        // ✅ Don't call ws.close() here - let onclose handle reconnection naturally
       };
     };
 
-    connect();
+    // ✅ Delay initial connection slightly to survive StrictMode's double-mount/unmount cycle
+    const initialTimeout = setTimeout(() => {
+      if (mountedRef.current && shouldReconnect) {
+        connect();
+      }
+    }, 100);
 
     return () => {
       shouldReconnect = false;
+      mountedRef.current = false; // ✅ Mark as unmounted
+      clearTimeout(initialTimeout);
 
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
 
       if (wsRef.current) {
-        wsRef.current.close();
+        // ✅ Only close if the WebSocket is not already closing/closed
+        if (
+          wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING
+        ) {
+          wsRef.current.close();
+        }
       }
 
       setIsConnected(false);
