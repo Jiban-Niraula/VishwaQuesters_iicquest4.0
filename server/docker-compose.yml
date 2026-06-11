@@ -1,17 +1,17 @@
 services:
-  postgres:
-    image: postgres:16
-    container_name: postgres-streamangle
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: admin123
-      POSTGRES_DB: visioncast
-      TZ: UTC
-    ports:
-      - "5439:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+   postgres:
+      image: postgres:16
+      container_name: postgres-streamangle
+      restart: unless-stopped
+      environment:
+         POSTGRES_USER: postgres
+         POSTGRES_PASSWORD: admin123
+         POSTGRES_DB: visioncast
+         TZ: UTC
+      ports:
+         - "5439:5432"
+      volumes:
+         - postgres_data:/var/lib/postgresql/data
 
 volumes:
-  postgres_data:
+   postgres_data:
