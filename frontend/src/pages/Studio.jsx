@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import useWebSocket from "../hooks/useWebSocket";
 import Hls from "hls.js";
+import StudioLayout from "./studio/StudioLayout";
 import {
   getOverlays,
   createOverlay,
@@ -20,41 +21,6 @@ import {
   completeSponsoredAdPlacement,
   resolveMediaUrl,
 } from "../services/api";
-
-const LAYOUTS = [
-  { id: "single", label: "Single", icon: "1" },
-  { id: "side-by-side", label: "Side by Side", icon: "2" },
-  { id: "pip", label: "Picture in Picture", icon: "PiP" },
-  { id: "grid", label: "2×2 Grid", icon: "4" },
-  { id: "wide-cu", label: "Wide + Close-up", icon: "W+C" },
-];
-
-const OVERLAY_TYPES = [
-  { id: "text", label: "Text Overlay" },
-  { id: "football-scorecard", label: "Football Scorecard" },
-  { id: "cricket-scorecard", label: "Cricket Scorecard" },
-  { id: "ad", label: "Advertisement (Video/Image)" },
-  { id: "replay", label: "Replay Video" },
-  { id: "image", label: "Image" },
-  { id: "video-link", label: "External Video / Live Stream" },
-];
-
-const OVERLAY_POSITIONS = [
-  { id: "top-left", label: "Top Left" },
-  { id: "top-right", label: "Top Right" },
-  { id: "bottom-left", label: "Bottom Left" },
-  { id: "bottom-right", label: "Bottom Right" },
-  { id: "center", label: "Center" },
-  { id: "full", label: "Full Screen" },
-];
-
-const PLATFORM_OPTIONS = [
-  { id: "youtube", label: "YouTube Live" },
-  { id: "facebook", label: "Facebook Live" },
-  { id: "twitch", label: "Twitch" },
-  { id: "custom", label: "Custom RTMP" },
-];
-
 function buildIceServers() {
   const iceServers = [
     // ✅ FIX: Multiple STUN servers for redundancy
@@ -106,6 +72,17 @@ const STREAM_FPS = 24;
 const RECORDER_CHUNK_MS = 250;
 const STREAM_VIDEO_BITRATE = 2_500_000;
 const STREAM_AUDIO_BITRATE = 128_000;
+
+// Browser-side AI Director assets. These are loaded only when Director mode is enabled.
+// If the model/CDN cannot load, Studio safely falls back to audio + motion scoring.
+const AI_DIRECTOR_TASKS_URL =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+const AI_DIRECTOR_WASM_URL =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
+const AI_DIRECTOR_FACE_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite";
+
+const clamp01 = (value) => Math.max(0, Math.min(1, value || 0));
 
 const getSupportedMimeType = () => {
   // For browser MediaRecorder → FFmpeg pipe, VP8 WebM is usually more stable.
@@ -159,16 +136,28 @@ export default function Studio() {
   const recordingDirHandleRef = useRef(null); // Directory handle from File System Access API
   const hlsInstancesRef = useRef({}); // hls.js instances keyed by overlay id
 
-  // Auto-switch refs
+  // Auto-switch / AI Director refs
   const autoSwitchEnabledRef = useRef(false);
   const lastSwitchTimeRef = useRef(0);
   const analyserNodesRef = useRef({}); // { [cameraId]: AnalyserNode }
   const prevFrameDataRef = useRef({}); // { [cameraId]: Uint8ClampedArray }
   const autoSwitchIntervalRef = useRef(null);
+  const autoSwitchBusyRef = useRef(false);
+  const camerasRef = useRef({});
+  const activeCameraIdRef = useRef(null);
+  const autoSwitchModeRef = useRef("director");
+  const faceDetectorRef = useRef(null);
+  const faceDetectorLoadingRef = useRef(false);
+  const aiDirectorStatusRef = useRef("idle");
+  const faceScoresRef = useRef({}); // { [cameraId]: latest face/person presence score }
+  const faceDetectionTimeRef = useRef({});
+  const autoSwitchScoresRef = useRef({});
 
   // State
   const [autoSwitchEnabled, setAutoSwitchEnabled] = useState(false);
-  const [autoSwitchMode, setAutoSwitchMode] = useState("audio"); // "audio" | "motion" | "both"
+  const [autoSwitchMode, setAutoSwitchMode] = useState("director"); // "director" | "audio" | "motion" | "both"
+  const [aiDirectorStatus, setAiDirectorStatus] = useState("idle"); // idle | loading | ready | fallback
+  const [aiDirectorScores, setAiDirectorScores] = useState({});
 
   // State
   const [cameras, setCameras] = useState({});
@@ -339,7 +328,50 @@ export default function Studio() {
     [drawVideoFit, cameraZoom],
   );
 
-  // ── Auto Camera Switching Engine ──────────────────────────────────
+  // ── AI Director / Auto Camera Switching Engine ────────────────
+
+  useEffect(() => {
+    camerasRef.current = cameras;
+  }, [cameras]);
+
+  useEffect(() => {
+    activeCameraIdRef.current = activeCameraId;
+  }, [activeCameraId]);
+
+  useEffect(() => {
+    autoSwitchModeRef.current = autoSwitchMode;
+  }, [autoSwitchMode]);
+
+  useEffect(() => {
+    aiDirectorStatusRef.current = aiDirectorStatus;
+  }, [aiDirectorStatus]);
+
+  // Remove stale auto-switch resources when a camera disappears.
+  useEffect(() => {
+    const activeIds = new Set(Object.keys(cameras));
+
+    [
+      analyserNodesRef,
+      prevFrameDataRef,
+      faceScoresRef,
+      faceDetectionTimeRef,
+      autoSwitchScoresRef,
+    ].forEach((ref) => {
+      Object.keys(ref.current).forEach((cameraId) => {
+        if (!activeIds.has(cameraId)) {
+          delete ref.current[cameraId];
+        }
+      });
+    });
+  }, [cameras]);
+
+  const cleanupAutoSwitchForCamera = useCallback((cameraId) => {
+    delete analyserNodesRef.current[cameraId];
+    delete prevFrameDataRef.current[cameraId];
+    delete faceScoresRef.current[cameraId];
+    delete faceDetectionTimeRef.current[cameraId];
+    delete autoSwitchScoresRef.current[cameraId];
+  }, []);
 
   // Get audio level (0-1) for a camera using AnalyserNode
   const getAudioLevel = useCallback((cameraId) => {
@@ -349,54 +381,59 @@ export default function Studio() {
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(dataArray);
 
-    // Average of frequency bins, normalized to 0-1
     let sum = 0;
     for (let i = 0; i < dataArray.length; i++) {
       sum += dataArray[i];
     }
-    return sum / (dataArray.length * 255);
+
+    return clamp01(sum / (dataArray.length * 255));
   }, []);
 
   // Get motion score (0-1) for a camera by comparing current frame to previous
   const getMotionScore = useCallback((cameraId, videoElement) => {
     if (
       !videoElement ||
-      videoElement.readyState < 2 ||
-      !videoElement.videoWidth
-    )
+      videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      !videoElement.videoWidth ||
+      !videoElement.videoHeight
+    ) {
       return 0;
-
-    const sampleSize = 40; // Downsample to 40x30 for speed
-    const sampleH = 30;
-
-    const tempCanvas = document.createElement("canvas");
-    tempCanvas.width = sampleSize;
-    tempCanvas.height = sampleH;
-    const ctx = tempCanvas.getContext("2d", { willReadFrequently: true });
-
-    ctx.drawImage(videoElement, 0, 0, sampleSize, sampleH);
-    const currentFrame = ctx.getImageData(0, 0, sampleSize, sampleH).data;
-
-    const prevFrame = prevFrameDataRef.current[cameraId];
-    prevFrameDataRef.current[cameraId] = currentFrame;
-
-    if (!prevFrame) return 0;
-
-    // Calculate pixel difference (only sample every 4th pixel for speed)
-    let diff = 0;
-    let count = 0;
-    for (let i = 0; i < currentFrame.length; i += 16) {
-      // Every 4th pixel (RGBA = 4 bytes, skip 4 pixels = 16 bytes)
-      const rDiff = Math.abs(currentFrame[i] - prevFrame[i]);
-      const gDiff = Math.abs(currentFrame[i + 1] - prevFrame[i + 1]);
-      const bDiff = Math.abs(currentFrame[i + 2] - prevFrame[i + 2]);
-      diff += (rDiff + gDiff + bDiff) / 3;
-      count++;
     }
 
-    // Normalize: typical motion gives 5-30 per pixel difference, heavy motion 30-80
-    const avgDiff = count > 0 ? diff / count : 0;
-    return Math.min(avgDiff / 40, 1); // Scale so ~40 avg diff = score of 1.0
+    const sampleW = 40;
+    const sampleH = 30;
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = sampleW;
+    tempCanvas.height = sampleH;
+
+    const ctx = tempCanvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return 0;
+
+    try {
+      ctx.drawImage(videoElement, 0, 0, sampleW, sampleH);
+      const currentFrame = ctx.getImageData(0, 0, sampleW, sampleH).data;
+      const prevFrame = prevFrameDataRef.current[cameraId];
+      // Copy the frame so later canvas operations cannot mutate the stored data.
+      prevFrameDataRef.current[cameraId] = new Uint8ClampedArray(currentFrame);
+
+      if (!prevFrame) return 0;
+
+      let diff = 0;
+      let count = 0;
+      for (let i = 0; i < currentFrame.length; i += 16) {
+        const rDiff = Math.abs(currentFrame[i] - prevFrame[i]);
+        const gDiff = Math.abs(currentFrame[i + 1] - prevFrame[i + 1]);
+        const bDiff = Math.abs(currentFrame[i + 2] - prevFrame[i + 2]);
+        diff += (rDiff + gDiff + bDiff) / 3;
+        count++;
+      }
+
+      const avgDiff = count > 0 ? diff / count : 0;
+      return clamp01(avgDiff / 40);
+    } catch (err) {
+      console.warn("AI Director motion scoring failed:", err);
+      return 0;
+    }
   }, []);
 
   // Wire up AnalyserNode for a camera's audio source
@@ -404,125 +441,285 @@ export default function Studio() {
     const audioSource = audioSourcesRef.current[cameraId];
     if (!audioSource?.sourceNode || !audioContextRef.current) return;
 
-    // Don't recreate if already exists
     if (analyserNodesRef.current[cameraId]) return;
 
-    const analyser = audioContextRef.current.createAnalyser();
-    analyser.fftSize = 256; // Small for speed (128 bins)
-    analyser.smoothingTimeConstant = 0.5;
+    try {
+      const analyser = audioContextRef.current.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.5;
 
-    // Connect: sourceNode → analyser (parallel to existing gainNode → destination)
-    audioSource.sourceNode.connect(analyser);
-    analyserNodesRef.current[cameraId] = analyser;
+      // Connect in parallel: sourceNode → analyser, while existing gainNode remains connected.
+      audioSource.sourceNode.connect(analyser);
+      analyserNodesRef.current[cameraId] = analyser;
 
-    console.log(`📊 AnalyserNode set up for camera ${cameraId}`);
+      console.log(`📊 AI Director analyser ready for camera ${cameraId}`);
+    } catch (err) {
+      console.warn(`AI Director could not attach analyser for ${cameraId}:`, err);
+    }
   }, []);
 
-  // The main auto-switch decision loop
-  const runAutoSwitch = useCallback(() => {
-    if (!autoSwitchEnabledRef.current) return;
+  const initAiDirectorModel = useCallback(async () => {
+    if (faceDetectorRef.current) return faceDetectorRef.current;
+    if (faceDetectorLoadingRef.current) return null;
 
-    const now = Date.now();
-    const MIN_DWELL = 3000; // Stay on a camera for at least 3 seconds
-    const COOLDOWN = 2000; // 2s cooldown between switches
+    faceDetectorLoadingRef.current = true;
+    aiDirectorStatusRef.current = "loading";
+    setAiDirectorStatus("loading");
 
-    if (now - lastSwitchTimeRef.current < MIN_DWELL) return;
+    try {
+      const { FaceDetector, FilesetResolver } = await import(
+        /* @vite-ignore */ AI_DIRECTOR_TASKS_URL
+      );
 
-    const cameraList = Object.values(cameras);
-    if (cameraList.length < 2) return; // Need at least 2 cameras
+      const vision = await FilesetResolver.forVisionTasks(AI_DIRECTOR_WASM_URL);
+      const detector = await FaceDetector.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: AI_DIRECTOR_FACE_MODEL_URL,
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        minDetectionConfidence: 0.5,
+        minSuppressionThreshold: 0.3,
+      });
 
-    let bestCameraId = null;
-    let bestScore = -1;
+      faceDetectorRef.current = detector;
+      aiDirectorStatusRef.current = "ready";
+      setAiDirectorStatus("ready");
+      console.log("🧠 AI Director face detector ready");
+      return detector;
+    } catch (err) {
+      // Demo-safe fallback: audio + motion still works if CDN/model/GPU is blocked.
+      console.warn("AI Director model unavailable. Falling back to audio + motion.", err);
+      faceDetectorRef.current = null;
+      aiDirectorStatusRef.current = "fallback";
+      setAiDirectorStatus("fallback");
+      return null;
+    } finally {
+      faceDetectorLoadingRef.current = false;
+    }
+  }, []);
 
-    cameraList.forEach((cam) => {
-      let score = 0;
+  const getFacePresenceScore = useCallback(
+    async (cameraId, videoElement) => {
+      if (
+        !videoElement ||
+        videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+        !videoElement.videoWidth ||
+        !videoElement.videoHeight
+      ) {
+        return 0;
+      }
 
-      // Audio-based scoring
-      if (autoSwitchMode === "audio" || autoSwitchMode === "both") {
-        // Ensure analyser is set up
+      const now = performance.now();
+      const lastDetection = faceDetectionTimeRef.current[cameraId] || 0;
+
+      // Face detection is heavier than audio/motion, so do it max once per second per camera.
+      if (now - lastDetection < 1000) {
+        return faceScoresRef.current[cameraId] || 0;
+      }
+
+      const detector = faceDetectorRef.current;
+      if (!detector) return 0;
+
+      try {
+        const result = detector.detectForVideo(videoElement, now);
+        const detections = result?.detections || [];
+        let best = 0;
+
+        detections.forEach((detection) => {
+          const confidence = clamp01(detection?.categories?.[0]?.score || 0);
+          const box = detection?.boundingBox;
+          const faceArea = box
+            ? clamp01((box.width * box.height) / (videoElement.videoWidth * videoElement.videoHeight))
+            : 0;
+
+          // Prefer confident and reasonably visible faces. This makes close-up/subject shots win.
+          const score = clamp01(confidence * 0.75 + Math.min(faceArea * 6, 1) * 0.25);
+          best = Math.max(best, score);
+        });
+
+        faceScoresRef.current[cameraId] = best;
+        faceDetectionTimeRef.current[cameraId] = now;
+        return best;
+      } catch (err) {
+        console.warn(`AI Director face scoring failed for ${cameraId}:`, err);
+        faceScoresRef.current[cameraId] = 0;
+        faceDetectionTimeRef.current[cameraId] = now;
+        return 0;
+      }
+    },
+    [],
+  );
+
+  const buildDirectorScore = useCallback(
+    async (cam, mode) => {
+      const audioLevel =
+        mode === "audio" || mode === "both" || mode === "director"
+          ? getAudioLevel(cam.id)
+          : 0;
+      const motionScore =
+        mode === "motion" || mode === "both" || mode === "director"
+          ? getMotionScore(cam.id, cam.videoElement)
+          : 0;
+      const faceScore =
+        mode === "director" ? await getFacePresenceScore(cam.id, cam.videoElement) : 0;
+
+      let total = 0;
+
+      if (mode === "audio") {
+        total = audioLevel;
+      } else if (mode === "motion") {
+        total = motionScore;
+      } else if (mode === "both") {
+        total = audioLevel * 0.65 + motionScore * 0.35;
+      } else {
+        // AI Director: voice + visible subject + scene movement.
+        // Face model is optional; if unavailable, this naturally behaves like audio+motion.
+        total = audioLevel * 0.45 + faceScore * 0.35 + motionScore * 0.2;
+      }
+
+      return {
+        total: clamp01(total),
+        audio: clamp01(audioLevel),
+        motion: clamp01(motionScore),
+        face: clamp01(faceScore),
+      };
+    },
+    [getAudioLevel, getMotionScore, getFacePresenceScore],
+  );
+
+  // The main AI Director decision loop
+  const runAutoSwitch = useCallback(async () => {
+    if (!autoSwitchEnabledRef.current || autoSwitchBusyRef.current) return;
+
+    autoSwitchBusyRef.current = true;
+
+    try {
+      const now = Date.now();
+      const MIN_DWELL = 3000; // Stay on a camera for at least 3 seconds
+      const cameraList = Object.values(camerasRef.current).filter(
+        (cam) => cam?.videoElement || cam?.stream,
+      );
+      const mode = autoSwitchModeRef.current;
+      const currentActiveId = activeCameraIdRef.current;
+
+      if (now - lastSwitchTimeRef.current < MIN_DWELL) return;
+      if (cameraList.length < 2) return;
+
+      if (
+        mode === "director" &&
+        !faceDetectorRef.current &&
+        aiDirectorStatusRef.current !== "fallback"
+      ) {
+        // Non-blocking: start loading if not already started.
+        initAiDirectorModel();
+      }
+
+      let bestCameraId = null;
+      let bestScore = -1;
+      const nextScores = {};
+
+      for (const cam of cameraList) {
         if (!analyserNodesRef.current[cam.id]) {
           setupAnalyserForCamera(cam.id);
         }
-        const audioLevel = getAudioLevel(cam.id);
-        score += audioLevel * 0.7; // Audio gets 70% weight
-      }
 
-      // Motion-based scoring
-      if (autoSwitchMode === "motion" || autoSwitchMode === "both") {
-        const videoEl = cam.videoElement;
-        const motionScore = getMotionScore(cam.id, videoEl);
+        const parts = await buildDirectorScore(cam, mode);
+        let score = parts.total;
 
-        if (autoSwitchMode === "motion") {
-          score += motionScore;
-        } else {
-          score += motionScore * 0.3; // Motion gets 30% weight in "both" mode
+        // Avoid hyperactive switching by giving the current camera a small stability bonus.
+        if (cam.id === currentActiveId) {
+          score *= 1.08;
+        }
+
+        nextScores[cam.id] = {
+          ...parts,
+          total: clamp01(score),
+          label: cam.deviceName || cam.id,
+        };
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestCameraId = cam.id;
         }
       }
 
-      // Small penalty for the currently active camera (avoid sticking)
-      if (cam.id === activeCameraId) {
-        score *= 0.85;
-      }
+      autoSwitchScoresRef.current = nextScores;
+      setAiDirectorScores(nextScores);
 
-      // Need a meaningful threshold to switch — don't switch for tiny differences
-      if (score > bestScore) {
-        bestScore = score;
-        bestCameraId = cam.id;
-      }
-    });
+      const activeScore = currentActiveId ? nextScores[currentActiveId]?.total || 0 : 0;
+      const margin = mode === "director" ? 0.08 : 0.06;
+      const threshold = mode === "audio" ? 0.06 : 0.08;
 
-    // Only switch if the best camera is different AND score is above threshold
-    const THRESHOLD = autoSwitchMode === "audio" ? 0.08 : 0.12;
-    if (
-      bestCameraId &&
-      bestCameraId !== activeCameraId &&
-      bestScore > THRESHOLD
-    ) {
-      console.log(
-        `🔄 Auto-switch: ${activeCameraId} → ${bestCameraId} (score: ${bestScore.toFixed(3)}, mode: ${autoSwitchMode})`,
-      );
-      setActiveCameraId(bestCameraId);
-      lastSwitchTimeRef.current = now;
+      if (
+        bestCameraId &&
+        bestCameraId !== currentActiveId &&
+        bestScore > threshold &&
+        bestScore - activeScore > margin
+      ) {
+        console.log(
+          `🧠 AI Director switch: ${currentActiveId} → ${bestCameraId} ` +
+            `(score: ${bestScore.toFixed(3)}, mode: ${mode})`,
+        );
+        setActiveCameraId(bestCameraId);
+        activeCameraIdRef.current = bestCameraId;
+        lastSwitchTimeRef.current = now;
+      }
+    } finally {
+      autoSwitchBusyRef.current = false;
     }
-  }, [
-    cameras,
-    activeCameraId,
-    autoSwitchMode,
-    getAudioLevel,
-    getMotionScore,
-    setupAnalyserForCamera,
-  ]);
+  }, [buildDirectorScore, initAiDirectorModel, setupAnalyserForCamera]);
 
-  // Start/stop auto-switch
+  // Start/stop AI Director / auto-switch
   const toggleAutoSwitch = useCallback(() => {
     const next = !autoSwitchEnabledRef.current;
     autoSwitchEnabledRef.current = next;
     setAutoSwitchEnabled(next);
 
     if (next) {
-      // Set up analysers for all existing cameras
       Object.keys(audioSourcesRef.current).forEach((camId) => {
         setupAnalyserForCamera(camId);
       });
 
-      // Run the check every 500ms (2 checks per second — very lightweight)
-      autoSwitchIntervalRef.current = setInterval(runAutoSwitch, 500);
+      if (autoSwitchModeRef.current === "director") {
+        initAiDirectorModel();
+      }
+
+      if (autoSwitchIntervalRef.current) {
+        clearInterval(autoSwitchIntervalRef.current);
+      }
+
+      autoSwitchIntervalRef.current = setInterval(() => {
+        runAutoSwitch();
+      }, 650);
       lastSwitchTimeRef.current = Date.now();
-      console.log("🔄 Auto-switch ENABLED");
+      console.log("🧠 AI Director ENABLED");
     } else {
       if (autoSwitchIntervalRef.current) {
         clearInterval(autoSwitchIntervalRef.current);
         autoSwitchIntervalRef.current = null;
       }
-      console.log("🔄 Auto-switch DISABLED");
+      setAiDirectorScores({});
+      console.log("🧠 AI Director DISABLED");
     }
-  }, [runAutoSwitch, setupAnalyserForCamera]);
+  }, [initAiDirectorModel, runAutoSwitch, setupAnalyserForCamera]);
+
+  useEffect(() => {
+    if (autoSwitchEnabledRef.current && autoSwitchMode === "director") {
+      initAiDirectorModel();
+    }
+  }, [autoSwitchMode, initAiDirectorModel]);
 
   // Clean up on unmount
   useEffect(() => {
     return () => {
       if (autoSwitchIntervalRef.current) {
         clearInterval(autoSwitchIntervalRef.current);
+      }
+      if (faceDetectorRef.current?.close) {
+        try {
+          faceDetectorRef.current.close();
+        } catch {}
       }
     };
   }, []);
@@ -1357,6 +1554,9 @@ export default function Studio() {
             existing.gainNode.disconnect();
           } catch (e) {}
           delete audioSourcesRef.current[sourceId];
+          if (sourceId !== "commentary" && !sourceId.startsWith("overlay_")) {
+            cleanupAutoSwitchForCamera(sourceId);
+          }
           console.log(`🔊 Web Audio Mixer: Disconnected source ${sourceId}`);
         }
       }
@@ -1368,6 +1568,7 @@ export default function Studio() {
     commentaryActive,
     commentaryMuted,
     activeOverlays,
+    cleanupAutoSwitchForCamera,
   ]);
 
   // Sync the audio mixer whenever inputs or active settings change
@@ -1607,6 +1808,7 @@ export default function Studio() {
           try {
             existing.gainNode.disconnect();
           } catch {}
+          cleanupAutoSwitchForCamera(cameraID);
         }
 
         const audioOnlyStream = new MediaStream([audioTrack]);
@@ -1760,6 +1962,7 @@ export default function Studio() {
             } catch {}
             delete audioSourcesRef.current[cameraID];
           }
+          cleanupAutoSwitchForCamera(cameraID);
 
           setCameras((prev) => {
             const next = { ...prev };
@@ -2690,6 +2893,7 @@ export default function Studio() {
       } catch (e) {}
       delete audioSourcesRef.current[sid];
     }
+    cleanupAutoSwitchForCamera(sid);
     setCameras((prev) => {
       const next = { ...prev };
       delete next[sid];
@@ -3229,2258 +3433,163 @@ export default function Studio() {
     }
   };
 
-  return (
-    <>
-      <style>{`
-          .vc-studio-shell {
-            --vc-bg: #050505;
-            --vc-panel: rgba(15, 15, 18, 0.94);
-            --vc-panel-2: rgba(22, 22, 26, 0.9);
-            --vc-card: rgba(255, 255, 255, 0.055);
-            --vc-card-strong: rgba(255, 255, 255, 0.09);
-            --vc-border: rgba(255, 255, 255, 0.11);
-            --vc-border-strong: rgba(255, 255, 255, 0.18);
-            --vc-muted: #a1a1aa;
-            --vc-soft: #e4e4e7;
-            --vc-primary: #ff4f1f;
-            --vc-primary-2: #ff7a45;
-            --vc-success: #22c55e;
-            --vc-danger: #ef4444;
-            background:
-              radial-gradient(circle at top left, rgba(255, 79, 31, 0.15), transparent 34%),
-              radial-gradient(circle at 72% 8%, rgba(59, 130, 246, 0.12), transparent 32%),
-              linear-gradient(135deg, #050505 0%, #09090b 54%, #050505 100%);
-            color: #fff;
-            font-family: "Poppins", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          }
-
-          .vc-topbar {
-            min-height: 78px;
-            background: rgba(6, 6, 8, 0.88);
-            border-bottom: 1px solid var(--vc-border);
-            backdrop-filter: blur(18px);
-            box-shadow: 0 18px 55px rgba(0, 0, 0, 0.34);
-          }
-
-          .vc-brand-mark {
-            width: 42px;
-            height: 42px;
-            border-radius: 16px;
-            display: grid;
-            place-items: center;
-            background: linear-gradient(135deg, var(--vc-primary), #7c2d12);
-            box-shadow: 0 16px 32px rgba(255, 79, 31, 0.28);
-          }
-
-          .vc-icon-btn,
-          .vc-action-btn,
-          .vc-live-btn,
-          .vc-danger-btn,
-          .vc-copy-btn {
-            border: 1px solid var(--vc-border);
-            border-radius: 14px;
-            transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
-          }
-
-          .vc-icon-btn:hover,
-          .vc-action-btn:hover,
-          .vc-live-btn:hover,
-          .vc-danger-btn:hover,
-          .vc-copy-btn:hover {
-            transform: translateY(-1px);
-          }
-
-          .vc-icon-btn {
-            width: 40px;
-            height: 40px;
-            display: grid;
-            place-items: center;
-            background: rgba(255, 255, 255, 0.055);
-            color: #d4d4d8;
-          }
-
-          .vc-icon-btn:hover {
-            background: rgba(255, 255, 255, 0.09);
-            color: #fff;
-            border-color: var(--vc-border-strong);
-          }
-
-          .vc-action-btn {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            min-height: 40px;
-            padding: 0 14px;
-            background: rgba(255, 255, 255, 0.06);
-            color: #e4e4e7;
-            font-size: 12px;
-            font-weight: 700;
-            white-space: nowrap;
-          }
-
-          .vc-action-btn:hover {
-            background: rgba(255, 255, 255, 0.1);
-            border-color: var(--vc-border-strong);
-          }
-
-          .vc-action-btn.is-active {
-            background: rgba(34, 197, 94, 0.18);
-            border-color: rgba(34, 197, 94, 0.36);
-            color: #bbf7d0;
-          }
-
-          .vc-action-btn.is-recording {
-            background: rgba(239, 68, 68, 0.18);
-            border-color: rgba(239, 68, 68, 0.42);
-            color: #fecaca;
-            box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.06);
-          }
-
-          .vc-live-btn,
-          .vc-danger-btn {
-            min-height: 44px;
-            padding: 0 20px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 9px;
-            color: #fff;
-            font-size: 13px;
-            font-weight: 800;
-            letter-spacing: 0.02em;
-            white-space: nowrap;
-          }
-
-          .vc-live-btn {
-            background: linear-gradient(135deg, var(--vc-primary), #dc2626);
-            border-color: rgba(255, 255, 255, 0.12);
-            box-shadow: 0 16px 38px rgba(255, 79, 31, 0.28);
-          }
-
-          .vc-live-btn:disabled {
-            cursor: not-allowed;
-            opacity: 0.48;
-            background: rgba(113, 113, 122, 0.34);
-            box-shadow: none;
-          }
-
-          .vc-danger-btn {
-            background: rgba(239, 68, 68, 0.2);
-            border-color: rgba(239, 68, 68, 0.42);
-            color: #fecaca;
-          }
-
-          .vc-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 7px;
-            min-height: 32px;
-            padding: 0 11px;
-            border-radius: 999px;
-            border: 1px solid var(--vc-border);
-            background: rgba(255, 255, 255, 0.055);
-            color: #d4d4d8;
-            font-size: 12px;
-            font-weight: 700;
-            white-space: nowrap;
-          }
-
-          .vc-pill strong {
-            color: #fff;
-            font-weight: 800;
-          }
-
-          .vc-live-pill {
-            border-color: rgba(239, 68, 68, 0.42);
-            background: rgba(239, 68, 68, 0.13);
-            color: #fecaca;
-          }
-
-          .vc-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 999px;
-            display: inline-block;
-            background: #f59e0b;
-            box-shadow: 0 0 0 5px rgba(245, 158, 11, 0.08);
-          }
-
-          .vc-dot.ok {
-            background: var(--vc-success);
-            box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.1);
-          }
-
-          .vc-dot.live {
-            background: var(--vc-danger);
-            box-shadow: 0 0 0 5px rgba(239, 68, 68, 0.1);
-            animation: vcPulse 1.4s infinite;
-          }
-
-          @keyframes vcPulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.55; transform: scale(0.82); }
-          }
-
-          .vc-workspace {
-            min-height: calc(100vh - 78px);
-          }
-
-          .vc-stage-wrap {
-            background:
-              linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
-              linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px),
-              radial-gradient(circle at center, rgba(255, 255, 255, 0.065), transparent 36%),
-              #050505;
-            background-size: 44px 44px, 44px 44px, auto, auto;
-          }
-
-          .vc-stage-card {
-            width: min(100%, 1280px);
-            background: rgba(10, 10, 12, 0.78);
-            border: 1px solid var(--vc-border);
-            border-radius: 26px;
-            padding: 16px;
-            box-shadow: 0 28px 90px rgba(0, 0, 0, 0.45);
-            backdrop-filter: blur(16px);
-          }
-
-          .vc-stage-header,
-          .vc-stage-footer {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            padding: 0 4px 14px;
-          }
-
-          .vc-stage-footer {
-            padding: 14px 4px 0;
-            color: var(--vc-muted);
-            font-size: 12px;
-          }
-
-          .vc-canvas-frame {
-            position: relative;
-            border-radius: 22px;
-            overflow: hidden;
-            background: #000;
-            border: 1px solid rgba(255, 255, 255, 0.14);
-            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04), 0 24px 70px rgba(0, 0, 0, 0.6);
-          }
-
-          .vc-canvas-frame::before {
-            content: "";
-            position: absolute;
-            inset: 0;
-            pointer-events: none;
-            border-radius: 22px;
-            background: linear-gradient(180deg, rgba(255,255,255,0.06), transparent 18%, transparent 82%, rgba(0,0,0,0.28));
-            z-index: 1;
-          }
-
-          .vc-canvas-frame canvas {
-            display: block;
-            width: 100%;
-            height: auto;
-            max-height: calc(100vh - 230px);
-            object-fit: contain;
-          }
-
-          .vc-side-panel {
-            width: 400px;
-            background: rgba(10, 10, 12, 0.9);
-            border-left: 1px solid var(--vc-border);
-            backdrop-filter: blur(18px);
-            box-shadow: -24px 0 70px rgba(0, 0, 0, 0.28);
-          }
-
-          .vc-panel-head {
-            padding: 18px;
-            border-bottom: 1px solid var(--vc-border);
-          }
-
-          .vc-panel-tabs {
-            display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
-            gap: 7px;
-            padding: 12px;
-            border-bottom: 1px solid var(--vc-border);
-            background: rgba(255, 255, 255, 0.025);
-          }
-
-          .vc-panel-tab {
-            min-height: 58px;
-            border-radius: 15px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            gap: 5px;
-            color: #a1a1aa;
-            background: rgba(255, 255, 255, 0.035);
-            border: 1px solid transparent;
-            font-size: 11px;
-            font-weight: 800;
-            transition: 0.18s ease;
-          }
-
-          .vc-panel-tab i {
-            font-size: 14px;
-          }
-
-          .vc-panel-tab:hover {
-            color: #fff;
-            background: rgba(255, 255, 255, 0.07);
-            border-color: var(--vc-border);
-          }
-
-          .vc-panel-tab.active {
-            color: #fff;
-            background: linear-gradient(135deg, rgba(255, 79, 31, 0.25), rgba(255, 122, 69, 0.08));
-            border-color: rgba(255, 79, 31, 0.4);
-            box-shadow: 0 12px 30px rgba(255, 79, 31, 0.13);
-          }
-
-          .vc-panel-body {
-            scrollbar-width: thin;
-            scrollbar-color: rgba(255, 79, 31, 0.55) rgba(255, 255, 255, 0.04);
-          }
-
-          .vc-panel-body::-webkit-scrollbar {
-            width: 8px;
-          }
-
-          .vc-panel-body::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.04);
-          }
-
-          .vc-panel-body::-webkit-scrollbar-thumb {
-            background: rgba(255, 79, 31, 0.55);
-            border-radius: 999px;
-          }
-
-          .vc-studio-shell .bg-gray-800,
-          .vc-studio-shell .bg-gray-900 {
-            background-color: rgba(255, 255, 255, 0.055) !important;
-            border: 1px solid rgba(255, 255, 255, 0.09);
-          }
-
-          .vc-studio-shell .bg-gray-700 {
-            background-color: rgba(255, 255, 255, 0.09) !important;
-          }
-
-          .vc-studio-shell .rounded-lg {
-            border-radius: 16px !important;
-          }
-
-          .vc-studio-shell input,
-          .vc-studio-shell select,
-          .vc-studio-shell textarea {
-            background: rgba(5, 5, 5, 0.45) !important;
-            border: 1px solid rgba(255, 255, 255, 0.13) !important;
-            border-radius: 13px !important;
-            color: #fff !important;
-            outline: none !important;
-          }
-
-          .vc-studio-shell input:focus,
-          .vc-studio-shell select:focus,
-          .vc-studio-shell textarea:focus {
-            border-color: rgba(255, 79, 31, 0.65) !important;
-            box-shadow: 0 0 0 4px rgba(255, 79, 31, 0.12) !important;
-          }
-
-          .vc-studio-shell button {
-            cursor: pointer;
-          }
-
-          .vc-studio-shell button:disabled {
-            cursor: not-allowed;
-          }
-
-          .vc-platform-icon {
-            width: 34px;
-            height: 34px;
-            display: grid;
-            place-items: center;
-            border-radius: 12px;
-            background: rgba(255, 255, 255, 0.07);
-            color: #fff;
-          }
-
-          .vc-share-card {
-            padding: 16px;
-            border-top: 1px solid var(--vc-border);
-            background: rgba(255, 255, 255, 0.025);
-          }
-
-          .vc-share-row {
-            display: grid;
-            grid-template-columns: 1fr auto;
-            gap: 8px;
-            align-items: center;
-          }
-
-          .vc-copy-btn {
-            width: 40px;
-            height: 40px;
-            display: grid;
-            place-items: center;
-            background: rgba(255, 255, 255, 0.065);
-            color: #e4e4e7;
-          }
-
-          .vc-copy-btn:hover {
-            color: #fff;
-            background: rgba(255, 79, 31, 0.18);
-            border-color: rgba(255, 79, 31, 0.36);
-          }
-
-          @media (max-width: 1180px) {
-            .vc-workspace { flex-direction: column; }
-            .vc-side-panel { width: 100%; border-left: 0; border-top: 1px solid var(--vc-border); max-height: none; }
-            .vc-canvas-frame canvas { max-height: none; }
-            .vc-topbar { position: static; }
-          }
-
-          @media (max-width: 820px) {
-            .vc-topbar-content { flex-direction: column; align-items: stretch; }
-            .vc-topbar-actions { flex-wrap: wrap; justify-content: flex-start; }
-            .vc-stage-header, .vc-stage-footer { flex-direction: column; align-items: flex-start; }
-            .vc-panel-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-            .vc-stage-card { border-radius: 18px; padding: 10px; }
-            .vc-canvas-frame { border-radius: 16px; }
-          }
-        `}</style>
-      <div className="vc-studio-shell min-h-screen text-white flex flex-col">
-        <header className="vc-topbar px-5 py-4 flex items-center">
-          <div className="vc-topbar-content w-full flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3 min-w-0">
-              <button
-                onClick={() => navigate("/creator/events")}
-                className="vc-icon-btn shrink-0"
-                title="Back to events"
-              >
-                <i className="fa-solid fa-arrow-left" />
-              </button>
-
-              <div className="vc-brand-mark shrink-0">
-                <i className="fa-solid fa-clapperboard text-white" />
-              </div>
-
-              <div className="min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <h1 className="text-lg font-extrabold tracking-tight leading-none">
-                    Vision Cast Studio
-                  </h1>
-                  {isLive && (
-                    <span className="vc-pill vc-live-pill">
-                      <span className="vc-dot live" /> Live {elapsed}
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2 mt-2 flex-wrap">
-                  <span className="vc-pill">
-                    <i className="fa-solid fa-key" /> Session{" "}
-                    <strong>{eventCode}</strong>
-                  </span>
-                  <span className="vc-pill">
-                    <i className="fa-solid fa-layer-group" />{" "}
-                    {LAYOUTS.find((layout) => layout.id === activeLayout)
-                      ?.label || "Single"}
-                  </span>
-                  <span className="vc-pill">
-                    <span className={`vc-dot ${isConnected ? "ok" : ""}`} />{" "}
-                    {isConnected ? "Connected" : "Connecting"}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="vc-topbar-actions flex items-center gap-2">
-              <button
-                onClick={
-                  downloadEnabled ? disableLocalRecording : enableLocalRecording
-                }
-                title={
-                  downloadEnabled
-                    ? "Stop local recording"
-                    : "Enable local 10s clip recording"
-                }
-                className={`vc-action-btn ${downloadEnabled ? "is-recording" : ""}`}
-              >
-                <i
-                  className={`fa-solid ${downloadEnabled ? "fa-circle-stop" : "fa-record-vinyl"}`}
-                />
-                <span>
-                  {downloadEnabled ? "Recording Clips" : "Record Clips"}
-                </span>
-              </button>
-
-              <button
-                onClick={
-                  isScreenSharing
-                    ? () => stopScreenShare(null)
-                    : startScreenShare
-                }
-                title={
-                  isScreenSharing ? "Stop screen share" : "Share your screen"
-                }
-                className={`vc-action-btn ${isScreenSharing ? "is-active" : ""}`}
-              >
-                <i className="fa-solid fa-display" />
-                <span>{isScreenSharing ? "Stop Share" : "Share Screen"}</span>
-              </button>
-
-              <span className="vc-pill">
-                <i className="fa-solid fa-eye" /> {viewerCount} viewers
-              </span>
-              <span className="vc-pill">
-                <i className="fa-solid fa-video" />{" "}
-                {Object.keys(cameras).length} cameras
-              </span>
-
-              {isLive ? (
-                <button onClick={endLive} className="vc-danger-btn">
-                  <i className="fa-solid fa-power-off" /> End Live
-                </button>
-              ) : (
-                <button
-                  onClick={goLive}
-                  disabled={Object.keys(cameras).length === 0}
-                  className="vc-live-btn"
-                >
-                  <i className="fa-solid fa-signal" /> Go Live
-                </button>
-              )}
-            </div>
-          </div>
-        </header>
-
-        <div className="vc-workspace flex flex-1 overflow-hidden">
-          <main className="vc-stage-wrap flex-1 flex items-center justify-center p-5 overflow-auto">
-            <section className="vc-stage-card">
-              <div className="vc-stage-header">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.22em] text-zinc-500 font-bold">
-                    Program Output
-                  </p>
-                  <h2 className="text-base font-bold mt-1">
-                    Live Preview Canvas
-                  </h2>
-                </div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="vc-pill">
-                    <i className="fa-solid fa-camera-retro" /> Active{" "}
-                    {activeCameraId
-                      ? cameras[activeCameraId]?.deviceName ||
-                        activeCameraId.split("_")[0]
-                      : "Auto"}
-                  </span>
-                  <span className="vc-pill">
-                    <i className="fa-solid fa-wand-magic-sparkles" />{" "}
-                    {
-                      Object.keys(activeOverlays).filter(
-                        (key) => activeOverlays[key],
-                      ).length
-                    }{" "}
-                    overlays
-                  </span>
-                </div>
-              </div>
-
-              <div className="vc-canvas-frame">
-                <canvas
-                  ref={canvasRef}
-                  width={STREAM_WIDTH}
-                  height={STREAM_HEIGHT}
-                  style={{ aspectRatio: "16/9" }}
-                />
-              </div>
-
-              <div className="vc-stage-footer">
-                <span>
-                  <i className="fa-solid fa-circle-info mr-2" /> Use the right
-                  panel to switch cameras, control overlays, mix audio, and
-                  start RTMP destinations.
-                </span>
-                <span className="font-mono text-zinc-500">
-                  1920×720 / 24fps
-                </span>
-              </div>
-            </section>
-          </main>
-
-          <aside className="vc-side-panel flex flex-col">
-            <div className="vc-panel-head">
-              <p className="text-xs uppercase tracking-[0.22em] text-zinc-500 font-bold">
-                Production Controls
-              </p>
-              <h2 className="text-base font-bold mt-1">Control Room</h2>
-            </div>
-
-            <div className="vc-panel-tabs">
-              {[
-                { id: "cameras", label: "Cameras", icon: "fa-solid fa-video" },
-                {
-                  id: "overlays",
-                  label: "Overlays",
-                  icon: "fa-solid fa-layer-group",
-                },
-                { id: "audio", label: "Audio", icon: "fa-solid fa-sliders" },
-                {
-                  id: "destinations",
-                  label: "Stream",
-                  icon: "fa-solid fa-broadcast-tower",
-                },
-                {
-                  id: "sponsored",
-                  label: "Ads",
-                  icon: "fa-solid fa-rectangle-ad",
-                },
-              ].map((tab) => (
-                <button
-                  key={tab.id}
-                  onClick={() => setActivePanel(tab.id)}
-                  className={`vc-panel-tab ${activePanel === tab.id ? "active" : ""}`}
-                >
-                  <i className={tab.icon} />
-                  <span>{tab.label}</span>
-                </button>
-              ))}
-            </div>
-
-            <div className="vc-panel-body flex-1 overflow-y-auto p-4">
-              {/* Cameras Panel */}
-              {activePanel === "cameras" && (
-                <div className="space-y-3">
-                  <h3 className="font-bold text-sm text-gray-400 uppercase">
-                    Connected Cameras ({Object.keys(cameras).length})
-                  </h3>
-
-                  {/* Auto-Switch Controls */}
-                  <div className="bg-gray-800 rounded-lg p-3 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <i className="fa-solid fa-wand-magic-sparkles text-purple-400 text-sm" />
-                        <span className="text-sm font-bold">Auto Switch</span>
-                      </div>
-                      <button
-                        onClick={toggleAutoSwitch}
-                        className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
-                          autoSwitchEnabled
-                            ? "bg-purple-600 text-white shadow-lg shadow-purple-600/30"
-                            : "bg-gray-700 text-gray-400 hover:bg-gray-600"
-                        }`}
-                      >
-                        {autoSwitchEnabled ? "ON" : "OFF"}
-                      </button>
-                    </div>
-                    {autoSwitchEnabled && (
-                      <div className="flex gap-1">
-                        {[
-                          {
-                            id: "audio",
-                            label: "Audio",
-                            icon: "fa-microphone",
-                          },
-                          {
-                            id: "motion",
-                            label: "Motion",
-                            icon: "fa-person-running",
-                          },
-                          { id: "both", label: "Both", icon: "fa-sliders" },
-                        ].map((mode) => (
-                          <button
-                            key={mode.id}
-                            onClick={() => setAutoSwitchMode(mode.id)}
-                            className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold transition-all flex flex-col items-center gap-1 ${
-                              autoSwitchMode === mode.id
-                                ? "bg-purple-600/30 text-purple-300 border border-purple-500/50"
-                                : "bg-gray-900 text-gray-500 border border-transparent hover:text-gray-300"
-                            }`}
-                          >
-                            <i className={`fa-solid ${mode.icon}`} />
-                            {mode.label}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {Object.values(cameras).length === 0 && (
-                    <div className="text-center py-6 text-gray-500">
-                      <i className="fa-solid fa-video-slash text-xl mb-2 block" />
-                      <p className="text-xs">No cameras connected yet</p>
-                    </div>
-                  )}
-
-                  {Object.values(cameras).map((cam) => {
-                    const isActive = activeCameraId === cam.id;
-                    const hasVideo =
-                      cam.stream && cam.stream.getVideoTracks().length > 0;
-                    const connState =
-                      peerConnectionsRef.current[cam.id]?.connectionState;
-
-                    return (
-                      <div
-                        key={cam.id}
-                        onClick={() => setActiveCameraId(cam.id)}
-                        className={`bg-gray-800 rounded-lg overflow-hidden cursor-pointer transition border-2 ${
-                          isActive
-                            ? "border-red-500 shadow-lg shadow-red-500/20"
-                            : "border-transparent hover:border-gray-600"
-                        }`}
-                      >
-                        {/* Row: Small Video + Camera Info */}
-                        <div className="flex items-center gap-3 p-2">
-                          {/* Small Live Video Thumbnail */}
-                          <div className="relative w-20 h-12 rounded-md overflow-hidden bg-black shrink-0">
-                            {hasVideo ? (
-                              <video
-                                autoPlay
-                                playsInline
-                                muted
-                                ref={(el) => {
-                                  if (el && cam.stream) {
-                                    el.srcObject = cam.stream;
-                                    if (el.paused) {
-                                      el.play().catch(() => {});
-                                    }
-                                  }
-                                }}
-                                className="w-full h-full object-cover"
-                              />
-                            ) : (
-                              <div className="w-full h-full flex items-center justify-center">
-                                <i className="fa-solid fa-video-slash text-gray-600 text-xs" />
-                              </div>
-                            )}
-                            {/* LIVE dot on thumbnail */}
-                            {isActive && (
-                              <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-                            )}
-                          </div>
-
-                          {/* Camera Name + Status */}
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <span
-                                className={`w-2 h-2 rounded-full shrink-0 ${
-                                  connState === "connected"
-                                    ? "bg-green-500"
-                                    : connState === "connecting"
-                                      ? "bg-yellow-500 animate-pulse"
-                                      : "bg-red-500"
-                                }`}
-                              />
-                              <span className="text-sm font-medium truncate">
-                                {cam.deviceName || cam.id.split("_")[0]}
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-2 mt-1">
-                              <span className="text-[10px] text-gray-500 uppercase">
-                                {cam.type}
-                              </span>
-                              {isActive && (
-                                <span className="text-[10px] bg-red-600 px-1.5 py-0.5 rounded font-bold">
-                                  ACTIVE
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Zoom Slider */}
-                        {cam.type !== "screen" && (
-                          <div className="px-2 pb-2 flex items-center gap-2">
-                            <span className="text-xs text-gray-400">Zoom</span>
-                            <input
-                              type="range"
-                              min="1"
-                              max="4"
-                              step="0.1"
-                              value={cameraZoom[cam.id] || 1}
-                              onClick={(e) => e.stopPropagation()}
-                              onChange={(e) =>
-                                setCameraZoom((p) => ({
-                                  ...p,
-                                  [cam.id]: parseFloat(e.target.value),
-                                }))
-                              }
-                              className="flex-1 accent-red-500"
-                            />
-                            <span className="text-xs text-gray-400 w-6">
-                              {(cameraZoom[cam.id] || 1).toFixed(1)}x
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-
-                  <h3 className="font-bold text-sm text-gray-400 uppercase mt-6">
-                    Layout
-                  </h3>
-                  <div className="grid grid-cols-5 gap-2">
-                    {LAYOUTS.map((layout) => (
-                      <button
-                        key={layout.id}
-                        onClick={() => changeLayout(layout.id)}
-                        title={layout.label}
-                        className={`p-2 rounded text-xs font-bold transition ${activeLayout === layout.id ? "bg-red-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}
-                      >
-                        {layout.icon}
-                      </button>
-                    ))}
-                  </div>
-
-                  {activeLayout !== "single" && (
-                    <div className="mt-6 space-y-3 border-t border-gray-800 pt-4">
-                      <h3 className="font-bold text-xs text-gray-400 uppercase tracking-wider">
-                        Grid Slot Assignment
-                      </h3>
-                      <div className="space-y-2">
-                        {/* Slot 1 Assignment */}
-                        <div className="flex items-center justify-between gap-2 text-xs">
-                          <span className="text-gray-400 font-medium whitespace-nowrap">
-                            Slot 1 (Main/Left):
-                          </span>
-                          <select
-                            value={slotAssignments.slot1 || ""}
-                            onChange={(e) =>
-                              setSlotAssignments((prev) => ({
-                                ...prev,
-                                slot1: e.target.value,
-                              }))
-                            }
-                            className="bg-gray-800 text-white rounded px-2 py-1 border border-gray-700 w-36 outline-none focus:border-red-500"
-                          >
-                            <option value="">Auto Select</option>
-                            {Object.values(cameras).map((cam) => (
-                              <option key={cam.id} value={cam.id}>
-                                {cam.deviceName || cam.id.split("_")[0]}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        {/* Slot 2 Assignment */}
-                        <div className="flex items-center justify-between gap-2 text-xs">
-                          <span className="text-gray-400 font-medium whitespace-nowrap">
-                            {activeLayout === "side-by-side" &&
-                              "Slot 2 (Right):"}
-                            {activeLayout === "pip" && "Slot 2 (PiP Float):"}
-                            {activeLayout === "grid" && "Slot 2 (Top Right):"}
-                            {activeLayout === "wide-cu" &&
-                              "Slot 2 (Top Thumbnail):"}
-                          </span>
-                          <select
-                            value={slotAssignments.slot2 || ""}
-                            onChange={(e) =>
-                              setSlotAssignments((prev) => ({
-                                ...prev,
-                                slot2: e.target.value,
-                              }))
-                            }
-                            className="bg-gray-800 text-white rounded px-2 py-1 border border-gray-700 w-36 outline-none focus:border-red-500"
-                          >
-                            <option value="">Auto Select</option>
-                            {Object.values(cameras).map((cam) => (
-                              <option key={cam.id} value={cam.id}>
-                                {cam.deviceName || cam.id.split("_")[0]}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        {/* Slot 3 Assignment */}
-                        {(activeLayout === "grid" ||
-                          activeLayout === "wide-cu") && (
-                          <div className="flex items-center justify-between gap-2 text-xs">
-                            <span className="text-gray-400 font-medium whitespace-nowrap">
-                              {activeLayout === "grid" &&
-                                "Slot 3 (Bottom Left):"}
-                              {activeLayout === "wide-cu" &&
-                                "Slot 3 (Bottom Thumbnail):"}
-                            </span>
-                            <select
-                              value={slotAssignments.slot3 || ""}
-                              onChange={(e) =>
-                                setSlotAssignments((prev) => ({
-                                  ...prev,
-                                  slot3: e.target.value,
-                                }))
-                              }
-                              className="bg-gray-800 text-white rounded px-2 py-1 border border-gray-700 w-36 outline-none focus:border-red-500"
-                            >
-                              <option value="">Auto Select</option>
-                              {Object.values(cameras).map((cam) => (
-                                <option key={cam.id} value={cam.id}>
-                                  {cam.deviceName || cam.id.split("_")[0]}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        )}
-
-                        {/* Slot 4 Assignment */}
-                        {activeLayout === "grid" && (
-                          <div className="flex items-center justify-between gap-2 text-xs">
-                            <span className="text-gray-400 font-medium whitespace-nowrap">
-                              Slot 4 (Bottom Right):
-                            </span>
-                            <select
-                              value={slotAssignments.slot4 || ""}
-                              onChange={(e) =>
-                                setSlotAssignments((prev) => ({
-                                  ...prev,
-                                  slot4: e.target.value,
-                                }))
-                              }
-                              className="bg-gray-800 text-white rounded px-2 py-1 border border-gray-700 w-36 outline-none focus:border-red-500"
-                            >
-                              <option value="">Auto Select</option>
-                              {Object.values(cameras).map((cam) => (
-                                <option key={cam.id} value={cam.id}>
-                                  {cam.deviceName || cam.id.split("_")[0]}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Overlays Panel - Simplified */}
-              {activePanel === "overlays" && (
-                <div className="space-y-4">
-                  <h3 className="font-bold text-sm text-gray-400 uppercase">
-                    Create Overlay
-                  </h3>
-                  <div className="bg-gray-800 rounded-lg p-3 space-y-2">
-                    <select
-                      value={newOverlay.type}
-                      onChange={(e) =>
-                        setNewOverlay({ ...newOverlay, type: e.target.value })
-                      }
-                      className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                    >
-                      {OVERLAY_TYPES.map((t) => (
-                        <option key={t.id} value={t.id}>
-                          {t.label}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      type="text"
-                      placeholder="Title"
-                      value={newOverlay.title}
-                      onChange={(e) =>
-                        setNewOverlay({ ...newOverlay, title: e.target.value })
-                      }
-                      className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                    />
-                    {newOverlay.type === "text" && (
-                      <textarea
-                        placeholder="Content"
-                        value={newOverlay.content}
-                        onChange={(e) =>
-                          setNewOverlay({
-                            ...newOverlay,
-                            content: e.target.value,
-                          })
-                        }
-                        className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm h-20"
-                      />
-                    )}
-                    {newOverlay.type === "football-scorecard" && (
-                      <div className="space-y-2">
-                        <input
-                          type="text"
-                          placeholder="Team A Name"
-                          onChange={(e) =>
-                            setScorecardData((p) => ({
-                              ...p,
-                              teamA: e.target.value,
-                              scoreA: 0,
-                            }))
-                          }
-                          className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                        />
-                        <input
-                          type="text"
-                          placeholder="Team B Name"
-                          onChange={(e) =>
-                            setScorecardData((p) => ({
-                              ...p,
-                              teamB: e.target.value,
-                              scoreB: 0,
-                            }))
-                          }
-                          className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                        />
-                      </div>
-                    )}
-                    {newOverlay.type === "cricket-scorecard" && (
-                      <div className="space-y-2">
-                        <input
-                          type="text"
-                          placeholder="Batting Team"
-                          onChange={(e) =>
-                            setScorecardData((p) => ({
-                              ...p,
-                              battingTeam: e.target.value,
-                              runs: 0,
-                              wickets: 0,
-                              overs: 0,
-                              bat1Name: "Player 1",
-                              bat1Runs: 0,
-                              bat1Strike: true,
-                              bat2Name: "Player 2",
-                              bat2Runs: 0,
-                              bat2Strike: false,
-                              bowlName: "Bowler 1",
-                              bowlOvers: 0,
-                              bowlRuns: 0,
-                              bowlWickets: 0,
-                              bowlHistory: "",
-                            }))
-                          }
-                          className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                        />
-                        <input
-                          type="text"
-                          placeholder="Bowling Team"
-                          onChange={(e) =>
-                            setScorecardData((p) => ({
-                              ...p,
-                              bowlingTeam: e.target.value,
-                            }))
-                          }
-                          className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                        />
-                      </div>
-                    )}
-                    {(newOverlay.type === "ad" ||
-                      newOverlay.type === "replay" ||
-                      newOverlay.type === "image") && (
-                      <input
-                        type="file"
-                        accept="image/*,video/*"
-                        onChange={(e) => {
-                          if (e.target.files && e.target.files[0]) {
-                            setNewOverlayMedia(e.target.files[0]);
-                          }
-                        }}
-                        className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm file:mr-4 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-gray-800 file:text-white hover:file:bg-gray-600"
-                      />
-                    )}
-                    {newOverlay.type === "video-link" && (
-                      <div className="space-y-2">
-                        <input
-                          type="text"
-                          placeholder="Live stream URL (e.g., .m3u8 or .mp4)"
-                          value={newOverlayVideoUrl}
-                          onChange={(e) =>
-                            setNewOverlayVideoUrl(e.target.value)
-                          }
-                          className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                        />
-                        {(newOverlayVideoUrl.includes("youtube.com") ||
-                          newOverlayVideoUrl.includes("youtu.be")) && (
-                          <div className="text-xs bg-amber-500/10 text-amber-300 p-3 rounded border border-amber-500/30 leading-relaxed">
-                            <i className="fa-solid fa-triangle-exclamation mr-1" />{" "}
-                            <b>YouTube Security Restriction</b>
-                            <br />
-                            Browsers forbid broadcasting YouTube streams
-                            directly inside a studio canvas due to security
-                            rules.
-                            <br />
-                            <br />
-                            <span className="text-white font-medium">
-                              Workaround:
-                            </span>{" "}
-                            Open the YouTube video in a new browser tab, and use
-                            the <b>Share Screen</b> button at the top of the
-                            studio to bring it into your broadcast!
-                          </div>
-                        )}
-                      </div>
-                    )}
-                    <select
-                      value={newOverlay.position}
-                      onChange={(e) =>
-                        setNewOverlay({
-                          ...newOverlay,
-                          position: e.target.value,
-                        })
-                      }
-                      className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                    >
-                      {OVERLAY_POSITIONS.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.label}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      onClick={handleCreateOverlay}
-                      className="w-full bg-red-600 hover:bg-red-700 rounded py-2 text-sm font-bold"
-                    >
-                      + Add Overlay
-                    </button>
-                  </div>
-                  <h3 className="font-bold text-sm text-gray-400 uppercase mt-4">
-                    Active Overlays
-                  </h3>
-                  {overlays.map((overlay) => (
-                    <div
-                      key={overlay.id}
-                      className="bg-gray-800 rounded-lg p-3 flex items-center justify-between"
-                    >
-                      <div>
-                        <span className="text-sm font-medium">
-                          {overlay.title}
-                        </span>
-                        <span className="ml-2 text-xs bg-gray-700 px-2 py-0.5 rounded">
-                          {overlay.type}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => toggleOverlayActive(overlay)}
-                          className={`px-3 py-1 rounded text-xs font-bold ${activeOverlays[overlay.id] ? "bg-green-600" : "bg-gray-700"}`}
-                        >
-                          {activeOverlays[overlay.id] ? "ON" : "OFF"}
-                        </button>
-                        <button
-                          onClick={() => handleDeleteOverlay(overlay.id)}
-                          className="text-red-400 hover:text-red-300 text-xs"
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Active Overlay Controls (Scorecards) */}
-              {activePanel === "overlays" &&
-                overlays.filter(
-                  (o) =>
-                    activeOverlays[o.id] &&
-                    (o.type === "football-scorecard" ||
-                      o.type === "cricket-scorecard"),
-                ).length > 0 && (
-                  <div className="px-4 pb-4 space-y-4">
-                    <h3 className="font-bold text-sm text-gray-400 uppercase mt-4 border-t border-gray-800 pt-4">
-                      Scorecard Controls
-                    </h3>
-                    {overlays
-                      .filter(
-                        (o) =>
-                          activeOverlays[o.id] &&
-                          (o.type === "football-scorecard" ||
-                            o.type === "cricket-scorecard"),
-                      )
-                      .map((overlay) => {
-                        const data = overlay.content
-                          ? JSON.parse(overlay.content)
-                          : {};
-                        return (
-                          <div
-                            key={`controls-${overlay.id}`}
-                            className="bg-gray-800 rounded-lg p-3 space-y-3"
-                          >
-                            <div className="text-sm font-bold text-white mb-2">
-                              {overlay.title}
-                            </div>
-                            {overlay.type === "football-scorecard" && (
-                              <div className="grid grid-cols-2 gap-2">
-                                <div className="space-y-1">
-                                  <div className="text-xs text-gray-400">
-                                    {data.teamA || "Team A"} Score
-                                  </div>
-                                  <div className="flex gap-1">
-                                    <button
-                                      onClick={() => {
-                                        data.scoreA = (data.scoreA || 0) + 1;
-                                        updateOverlay(overlay.id, {
-                                          content: JSON.stringify(data),
-                                        }).then(() => {
-                                          overlay.content =
-                                            JSON.stringify(data);
-                                          setOverlays([...overlays]);
-                                        });
-                                      }}
-                                      className="flex-1 bg-gray-700 hover:bg-gray-600 rounded py-1 text-sm"
-                                    >
-                                      +
-                                    </button>
-                                    <button
-                                      onClick={() => {
-                                        data.scoreA = Math.max(
-                                          0,
-                                          (data.scoreA || 0) - 1,
-                                        );
-                                        updateOverlay(overlay.id, {
-                                          content: JSON.stringify(data),
-                                        }).then(() => {
-                                          overlay.content =
-                                            JSON.stringify(data);
-                                          setOverlays([...overlays]);
-                                        });
-                                      }}
-                                      className="flex-1 bg-gray-700 hover:bg-gray-600 rounded py-1 text-sm"
-                                    >
-                                      -
-                                    </button>
-                                  </div>
-                                </div>
-                                <div className="space-y-1">
-                                  <div className="text-xs text-gray-400">
-                                    {data.teamB || "Team B"} Score
-                                  </div>
-                                  <div className="flex gap-1">
-                                    <button
-                                      onClick={() => {
-                                        data.scoreB = (data.scoreB || 0) + 1;
-                                        updateOverlay(overlay.id, {
-                                          content: JSON.stringify(data),
-                                        }).then(() => {
-                                          overlay.content =
-                                            JSON.stringify(data);
-                                          setOverlays([...overlays]);
-                                        });
-                                      }}
-                                      className="flex-1 bg-gray-700 hover:bg-gray-600 rounded py-1 text-sm"
-                                    >
-                                      +
-                                    </button>
-                                    <button
-                                      onClick={() => {
-                                        data.scoreB = Math.max(
-                                          0,
-                                          (data.scoreB || 0) - 1,
-                                        );
-                                        updateOverlay(overlay.id, {
-                                          content: JSON.stringify(data),
-                                        }).then(() => {
-                                          overlay.content =
-                                            JSON.stringify(data);
-                                          setOverlays([...overlays]);
-                                        });
-                                      }}
-                                      className="flex-1 bg-gray-700 hover:bg-gray-600 rounded py-1 text-sm"
-                                    >
-                                      -
-                                    </button>
-                                  </div>
-                                </div>
-                              </div>
-                            )}
-                            {overlay.type === "cricket-scorecard" &&
-                              (() => {
-                                const d = overlay.content
-                                  ? JSON.parse(overlay.content)
-                                  : {};
-                                const bat1Strike = d.bat1Strike !== false;
-                                const deliveryBtn = (
-                                  label,
-                                  delivery,
-                                  color = "bg-gray-700 hover:bg-gray-600",
-                                ) => (
-                                  <button
-                                    key={label}
-                                    onClick={() =>
-                                      addDelivery(overlay, delivery)
-                                    }
-                                    className={`${color} text-white font-bold rounded py-2 text-sm transition-all active:scale-95`}
-                                  >
-                                    {label}
-                                  </button>
-                                );
-                                const updateField = (field, value) => {
-                                  d[field] = value;
-                                  updateOverlay(overlay.id, {
-                                    content: JSON.stringify(d),
-                                  }).then(() => {
-                                    overlay.content = JSON.stringify(d);
-                                    setOverlays((prev) => [...prev]);
-                                  });
-                                };
-                                return (
-                                  <div className="space-y-3">
-                                    {/* Batsmen Names */}
-                                    <div className="space-y-1">
-                                      <div className="text-xs text-gray-400 uppercase font-semibold">
-                                        Batsmen
-                                      </div>
-                                      <div className="flex gap-2 items-center">
-                                        <span
-                                          className={`w-2 h-2 rounded-full shrink-0 ${bat1Strike ? "bg-green-400" : "bg-gray-600"}`}
-                                        />
-                                        <input
-                                          type="text"
-                                          value={d.bat1Name || ""}
-                                          onChange={(e) =>
-                                            updateField(
-                                              "bat1Name",
-                                              e.target.value,
-                                            )
-                                          }
-                                          placeholder="Batsman 1"
-                                          className="flex-1 bg-gray-700 text-white rounded px-2 py-1 text-sm"
-                                        />
-                                        <span className="text-amber-400 font-bold text-sm w-8 text-center">
-                                          {d.bat1Runs || 0}
-                                        </span>
-                                        <button
-                                          onClick={() => {
-                                            d.bat1Strike = true;
-                                            d.bat2Strike = false;
-                                            updateField("bat1Strike", true);
-                                          }}
-                                          className={`text-xs px-2 py-1 rounded ${bat1Strike ? "bg-green-600 text-white" : "bg-gray-700 text-gray-400"}`}
-                                        >
-                                          *
-                                        </button>
-                                      </div>
-                                      <div className="flex gap-2 items-center">
-                                        <span
-                                          className={`w-2 h-2 rounded-full shrink-0 ${!bat1Strike ? "bg-green-400" : "bg-gray-600"}`}
-                                        />
-                                        <input
-                                          type="text"
-                                          value={d.bat2Name || ""}
-                                          onChange={(e) =>
-                                            updateField(
-                                              "bat2Name",
-                                              e.target.value,
-                                            )
-                                          }
-                                          placeholder="Batsman 2"
-                                          className="flex-1 bg-gray-700 text-white rounded px-2 py-1 text-sm"
-                                        />
-                                        <span className="text-amber-400 font-bold text-sm w-8 text-center">
-                                          {d.bat2Runs || 0}
-                                        </span>
-                                        <button
-                                          onClick={() => {
-                                            d.bat2Strike = true;
-                                            d.bat1Strike = false;
-                                            updateField("bat2Strike", true);
-                                          }}
-                                          className={`text-xs px-2 py-1 rounded ${!bat1Strike ? "bg-green-600 text-white" : "bg-gray-700 text-gray-400"}`}
-                                        >
-                                          *
-                                        </button>
-                                      </div>
-                                    </div>
-
-                                    {/* Bowler */}
-                                    <div className="space-y-2">
-                                      <div className="text-xs text-gray-400 uppercase font-semibold">
-                                        Bowler
-                                      </div>
-                                      {/* Current bowler name + figures */}
-                                      <div className="flex gap-2 items-center">
-                                        <input
-                                          type="text"
-                                          value={d.bowlName || ""}
-                                          onChange={(e) =>
-                                            updateField(
-                                              "bowlName",
-                                              e.target.value,
-                                            )
-                                          }
-                                          placeholder="Bowler Name"
-                                          className="flex-1 bg-gray-700 text-white rounded px-2 py-1 text-sm"
-                                        />
-                                        <span className="text-xs text-amber-400 font-mono font-bold whitespace-nowrap">
-                                          {d.bowlOvers || 0}-
-                                          {d.bowlWickets || 0}-{d.bowlRuns || 0}
-                                        </span>
-                                      </div>
-
-                                      {/* Change Bowler panel */}
-                                      <div className="bg-gray-900 rounded p-2 space-y-2">
-                                        <div className="text-xs text-gray-500">
-                                          Change bowler →
-                                        </div>
-                                        {/* Select a previous bowler */}
-                                        {(d.bowlingLog || []).length > 0 && (
-                                          <select
-                                            defaultValue=""
-                                            onChange={(e) => {
-                                              if (!e.target.value) return;
-                                              // Save current bowler first
-                                              const existing = [
-                                                ...(d.bowlingLog || []),
-                                              ];
-                                              const idx = existing.findIndex(
-                                                (b) => b.name === d.bowlName,
-                                              );
-                                              if (idx >= 0) {
-                                                existing[idx] = {
-                                                  ...existing[idx],
-                                                  overs:
-                                                    existing[idx].overs +
-                                                    (d.bowlOvers || 0),
-                                                  wickets:
-                                                    existing[idx].wickets +
-                                                    (d.bowlWickets || 0),
-                                                  runs:
-                                                    existing[idx].runs +
-                                                    (d.bowlRuns || 0),
-                                                };
-                                              } else if (d.bowlName) {
-                                                existing.push({
-                                                  name: d.bowlName,
-                                                  overs: d.bowlOvers || 0,
-                                                  wickets: d.bowlWickets || 0,
-                                                  runs: d.bowlRuns || 0,
-                                                });
-                                              }
-                                              // Restore selected previous bowler's accumulated stats
-                                              const sel =
-                                                existing.find(
-                                                  (b) =>
-                                                    b.name === e.target.value,
-                                                ) || {};
-                                              const remaining = existing.filter(
-                                                (b) =>
-                                                  b.name !== e.target.value,
-                                              );
-                                              d.bowlingLog = remaining;
-                                              d.bowlName =
-                                                sel.name || e.target.value;
-                                              d.bowlOvers = sel.overs || 0;
-                                              d.bowlWickets = sel.wickets || 0;
-                                              d.bowlRuns = sel.runs || 0;
-                                              d.bowlHistory = "";
-                                              d.legalBalls = 0;
-                                              updateOverlay(overlay.id, {
-                                                content: JSON.stringify(d),
-                                              }).then(() => {
-                                                overlay.content =
-                                                  JSON.stringify(d);
-                                                setOverlays((prev) => [
-                                                  ...prev,
-                                                ]);
-                                              });
-                                              e.target.value = "";
-                                            }}
-                                            className="w-full bg-gray-700 text-white rounded px-2 py-1 text-sm"
-                                          >
-                                            <option value="">
-                                              ↩ Return a previous bowler…
-                                            </option>
-                                            {(d.bowlingLog || []).map(
-                                              (b, i) => (
-                                                <option key={i} value={b.name}>
-                                                  {b.name} ({b.overs}-
-                                                  {b.wickets}-{b.runs})
-                                                </option>
-                                              ),
-                                            )}
-                                          </select>
-                                        )}
-                                        {/* New bowler name field */}
-                                        <div className="flex gap-1">
-                                          <input
-                                            id={`new-bowler-${overlay.id}`}
-                                            type="text"
-                                            placeholder="New bowler name…"
-                                            className="flex-1 bg-gray-700 text-white rounded px-2 py-1 text-sm"
-                                          />
-                                          <button
-                                            onClick={() => {
-                                              const input =
-                                                document.getElementById(
-                                                  `new-bowler-${overlay.id}`,
-                                                );
-                                              const newName =
-                                                input?.value?.trim();
-                                              // Save current bowler
-                                              const existing = [
-                                                ...(d.bowlingLog || []),
-                                              ];
-                                              const idx = existing.findIndex(
-                                                (b) => b.name === d.bowlName,
-                                              );
-                                              if (idx >= 0) {
-                                                existing[idx] = {
-                                                  ...existing[idx],
-                                                  overs:
-                                                    existing[idx].overs +
-                                                    (d.bowlOvers || 0),
-                                                  wickets:
-                                                    existing[idx].wickets +
-                                                    (d.bowlWickets || 0),
-                                                  runs:
-                                                    existing[idx].runs +
-                                                    (d.bowlRuns || 0),
-                                                };
-                                              } else if (d.bowlName) {
-                                                existing.push({
-                                                  name: d.bowlName,
-                                                  overs: d.bowlOvers || 0,
-                                                  wickets: d.bowlWickets || 0,
-                                                  runs: d.bowlRuns || 0,
-                                                });
-                                              }
-                                              d.bowlingLog = existing;
-                                              d.bowlName =
-                                                newName || "New Bowler";
-                                              d.bowlOvers = 0;
-                                              d.bowlRuns = 0;
-                                              d.bowlWickets = 0;
-                                              d.bowlHistory = "";
-                                              d.legalBalls = 0;
-                                              if (input) input.value = "";
-                                              updateOverlay(overlay.id, {
-                                                content: JSON.stringify(d),
-                                              }).then(() => {
-                                                overlay.content =
-                                                  JSON.stringify(d);
-                                                setOverlays((prev) => [
-                                                  ...prev,
-                                                ]);
-                                              });
-                                            }}
-                                            className="bg-indigo-700 hover:bg-indigo-600 text-white text-xs px-3 py-1 rounded whitespace-nowrap"
-                                          >
-                                            Set
-                                          </button>
-                                        </div>
-                                      </div>
-                                      {/* Bowling log summary */}
-                                      {(d.bowlingLog || []).length > 0 && (
-                                        <div className="bg-gray-900 rounded p-2 space-y-1">
-                                          <div className="text-xs text-gray-500 uppercase mb-1">
-                                            Bowling Log (O-W-R)
-                                          </div>
-                                          {(d.bowlingLog || []).map((b, i) => (
-                                            <div
-                                              key={i}
-                                              className="flex justify-between text-xs"
-                                            >
-                                              <span className="text-gray-300">
-                                                {b.name}
-                                              </span>
-                                              <span className="text-amber-400 font-mono">
-                                                {b.overs}-{b.wickets}-{b.runs}
-                                              </span>
-                                            </div>
-                                          ))}
-                                        </div>
-                                      )}
-                                    </div>
-
-                                    {/* Current Over Balls */}
-                                    {d.bowlHistory && (
-                                      <div className="flex gap-1 flex-wrap">
-                                        <span className="text-xs text-gray-500 mr-1 self-center">
-                                          This over:
-                                        </span>
-                                        {d.bowlHistory
-                                          .split(" ")
-                                          .filter(Boolean)
-                                          .map((ball, i) => (
-                                            <span
-                                              key={i}
-                                              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white
-                                      ${ball === "W" ? "bg-red-600" : ball === "4" || ball === "6" ? "bg-blue-600" : ball === "Wd" || ball === "Nb" ? "bg-yellow-600" : "bg-gray-600"}`}
-                                            >
-                                              {ball}
-                                            </span>
-                                          ))}
-                                      </div>
-                                    )}
-
-                                    {/* Score Status */}
-                                    <div className="bg-gray-900 rounded p-2 flex justify-between text-sm">
-                                      <span className="text-white font-bold">
-                                        {d.runs || 0}-{d.wickets || 0}
-                                      </span>
-                                      <span className="text-gray-400">
-                                        Overs: {d.overs || "0.0"}
-                                      </span>
-                                      <span className="text-xs text-gray-500">
-                                        {d.legalBalls || 0}/6 balls
-                                      </span>
-                                    </div>
-
-                                    {/* Runs Buttons */}
-                                    <div>
-                                      <div className="text-xs text-gray-400 mb-1 uppercase font-semibold">
-                                        Runs
-                                      </div>
-                                      <div className="grid grid-cols-6 gap-1">
-                                        {deliveryBtn("0", "0")}
-                                        {deliveryBtn("1", "1")}
-                                        {deliveryBtn("2", "2")}
-                                        {deliveryBtn("3", "3")}
-                                        {deliveryBtn(
-                                          "4",
-                                          "4",
-                                          "bg-blue-700 hover:bg-blue-600",
-                                        )}
-                                        {deliveryBtn(
-                                          "6",
-                                          "6",
-                                          "bg-blue-700 hover:bg-blue-600",
-                                        )}
-                                      </div>
-                                    </div>
-
-                                    {/* Extras */}
-                                    <div className="space-y-2">
-                                      <div className="text-xs text-gray-400 mb-1 uppercase font-semibold">
-                                        Extras
-                                      </div>
-
-                                      {/* Wide */}
-                                      <div className="flex items-center gap-1">
-                                        <span className="text-xs text-yellow-400 w-16 shrink-0 font-semibold">
-                                          Wide
-                                        </span>
-                                        <div className="grid grid-cols-6 gap-1 flex-1">
-                                          {deliveryBtn(
-                                            "Wd",
-                                            "Wd",
-                                            "bg-yellow-700 hover:bg-yellow-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+1",
-                                            "Wd+1",
-                                            "bg-yellow-700 hover:bg-yellow-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+2",
-                                            "Wd+2",
-                                            "bg-yellow-700 hover:bg-yellow-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+3",
-                                            "Wd+3",
-                                            "bg-yellow-700 hover:bg-yellow-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+4",
-                                            "Wd+4",
-                                            "bg-yellow-700 hover:bg-yellow-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+5",
-                                            "Wd+5",
-                                            "bg-yellow-700 hover:bg-yellow-600",
-                                          )}
-                                        </div>
-                                      </div>
-
-                                      {/* No Ball */}
-                                      <div className="flex items-center gap-1">
-                                        <span className="text-xs text-orange-400 w-16 shrink-0 font-semibold">
-                                          No Ball
-                                        </span>
-                                        <div className="grid grid-cols-6 gap-1 flex-1">
-                                          {deliveryBtn(
-                                            "Nb",
-                                            "Nb",
-                                            "bg-orange-700 hover:bg-orange-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+1",
-                                            "Nb+1",
-                                            "bg-orange-700 hover:bg-orange-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+2",
-                                            "Nb+2",
-                                            "bg-orange-700 hover:bg-orange-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+3",
-                                            "Nb+3",
-                                            "bg-orange-700 hover:bg-orange-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+4",
-                                            "Nb+4",
-                                            "bg-orange-700 hover:bg-orange-600",
-                                          )}
-                                          {deliveryBtn(
-                                            "+6",
-                                            "Nb+6",
-                                            "bg-orange-700 hover:bg-orange-600",
-                                          )}
-                                        </div>
-                                      </div>
-
-                                      {/* Leg Bye */}
-                                      <div className="flex items-center gap-1">
-                                        <span className="text-xs text-blue-300 w-16 shrink-0 font-semibold">
-                                          Leg Bye
-                                        </span>
-                                        <div className="grid grid-cols-4 gap-1 flex-1">
-                                          {deliveryBtn(
-                                            "Lb+1",
-                                            "Lb+1",
-                                            "bg-slate-600 hover:bg-slate-500",
-                                          )}
-                                          {deliveryBtn(
-                                            "Lb+2",
-                                            "Lb+2",
-                                            "bg-slate-600 hover:bg-slate-500",
-                                          )}
-                                          {deliveryBtn(
-                                            "Lb+3",
-                                            "Lb+3",
-                                            "bg-slate-600 hover:bg-slate-500",
-                                          )}
-                                          {deliveryBtn(
-                                            "Lb+4",
-                                            "Lb+4",
-                                            "bg-slate-600 hover:bg-slate-500",
-                                          )}
-                                        </div>
-                                      </div>
-
-                                      {/* Bye */}
-                                      <div className="flex items-center gap-1">
-                                        <span className="text-xs text-purple-300 w-16 shrink-0 font-semibold">
-                                          Bye
-                                        </span>
-                                        <div className="grid grid-cols-4 gap-1 flex-1">
-                                          {deliveryBtn(
-                                            "B+1",
-                                            "B+1",
-                                            "bg-purple-800 hover:bg-purple-700",
-                                          )}
-                                          {deliveryBtn(
-                                            "B+2",
-                                            "B+2",
-                                            "bg-purple-800 hover:bg-purple-700",
-                                          )}
-                                          {deliveryBtn(
-                                            "B+3",
-                                            "B+3",
-                                            "bg-purple-800 hover:bg-purple-700",
-                                          )}
-                                          {deliveryBtn(
-                                            "B+4",
-                                            "B+4",
-                                            "bg-purple-800 hover:bg-purple-700",
-                                          )}
-                                        </div>
-                                      </div>
-                                    </div>
-
-                                    {/* Wicket + Undo */}
-                                    <div className="grid grid-cols-2 gap-2">
-                                      {deliveryBtn(
-                                        "⚡ WICKET",
-                                        "W",
-                                        "bg-red-700 hover:bg-red-600 col-span-1",
-                                      )}
-                                      {deliveryBtn(
-                                        "↩ Undo",
-                                        "Undo",
-                                        "bg-gray-600 hover:bg-gray-500 col-span-1",
-                                      )}
-                                    </div>
-
-                                    {/* Download Summary */}
-                                    <button
-                                      onClick={() => {
-                                        const allBatsmen = [
-                                          ...(d.battingLog || []),
-                                          {
-                                            name: d.bat1Name || "Batsman 1",
-                                            runs: d.bat1Runs || 0,
-                                            out: false,
-                                          },
-                                          {
-                                            name: d.bat2Name || "Batsman 2",
-                                            runs: d.bat2Runs || 0,
-                                            out: false,
-                                          },
-                                        ];
-                                        const allBowlers = [
-                                          ...(d.bowlingLog || []),
-                                          {
-                                            name: d.bowlName || "Bowler",
-                                            overs: d.bowlOvers || 0,
-                                            wickets: d.bowlWickets || 0,
-                                            runs: d.bowlRuns || 0,
-                                          },
-                                        ];
-                                        const lines = [
-                                          "===== MATCH SCORECARD =====",
-                                          `Score: ${d.runs || 0}/${d.wickets || 0}  (${d.overs || 0} overs)`,
-                                          "",
-                                          "--- BATTING ---",
-                                          "Batsman                 Runs  Status",
-                                          ...allBatsmen.map(
-                                            (b) =>
-                                              `${(b.name || "").padEnd(24)}${String(b.runs || 0).padEnd(6)}${b.out ? "Out" : "Not Out"}`,
-                                          ),
-                                          "",
-                                          "--- BOWLING ---",
-                                          "Bowler                  Overs  Wkts  Runs",
-                                          ...allBowlers.map(
-                                            (b) =>
-                                              `${(b.name || "").padEnd(24)}${String(b.overs || 0).padEnd(7)}${String(b.wickets || 0).padEnd(6)}${b.runs || 0}`,
-                                          ),
-                                          "",
-                                          `Generated: ${new Date().toLocaleString()}`,
-                                        ];
-                                        const blob = new Blob(
-                                          [lines.join("\n")],
-                                          { type: "text/plain" },
-                                        );
-                                        const url = URL.createObjectURL(blob);
-                                        const a = document.createElement("a");
-                                        a.href = url;
-                                        a.download = "scorecard.txt";
-                                        a.click();
-                                        URL.revokeObjectURL(url);
-                                      }}
-                                      className="w-full bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-bold rounded py-2 transition-all"
-                                    >
-                                      Download Match Summary
-                                    </button>
-                                  </div>
-                                );
-                              })()}
-                          </div>
-                        );
-                      })}
-                  </div>
-                )}
-
-              {/* Audio Panel */}
-              {/* Audio Panel - Add source selection */}
-              {activePanel === "audio" && (
-                <div className="space-y-4">
-                  <h3 className="font-bold text-sm text-gray-400 uppercase">
-                    Audio Source
-                  </h3>
-                  <select
-                    value={activeAudioSource || ""}
-                    onChange={(e) =>
-                      setActiveAudioSource(e.target.value || null)
-                    }
-                    className="w-full bg-gray-800 text-white rounded-lg px-4 py-3"
-                  >
-                    <option value="">No Audio</option>
-                    {Object.values(cameras).map((cam) => (
-                      <option key={cam.id} value={cam.id}>
-                        Camera: {cam.deviceName || cam.id.split("_")[0]}{" "}
-                        {cam.stream.getAudioTracks().length === 0
-                          ? "(no mic)"
-                          : ""}
-                      </option>
-                    ))}
-                    <option value="commentary">Commentary Mic</option>
-                  </select>
-
-                  <h3 className="font-bold text-sm text-gray-400 uppercase mt-6">
-                    Camera Audio
-                  </h3>
-                  {Object.values(cameras).map((cam) => {
-                    const hasMic = cam.stream.getAudioTracks().length > 0;
-                    const isMuted = mutedCameras[cam.id];
-                    const isActive = activeAudioSource === cam.id;
-
-                    return (
-                      <div
-                        key={cam.id}
-                        className={`bg-gray-800 rounded-lg p-3 flex items-center justify-between border transition ${isActive && !isMuted ? "border-green-500/50" : "border-transparent"}`}
-                      >
-                        <div className="flex flex-col">
-                          <span className="text-sm font-medium">
-                            {cam.deviceName || cam.id.split("_")[0]}
-                          </span>
-                          <span className="text-xs mt-1">
-                            {!hasMic ? (
-                              <span className="text-gray-500">
-                                No mic input
-                              </span>
-                            ) : isMuted ? (
-                              <span className="text-red-400 font-semibold">
-                                Muted
-                              </span>
-                            ) : isActive ? (
-                              <span className="text-green-400 font-bold">
-                                Main Voice (Highlighted)
-                              </span>
-                            ) : (
-                              <span className="text-indigo-400">
-                                Ducked (Background)
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                        {hasMic && (
-                          <button
-                            onClick={() => {
-                              const audioTracks = cam.stream.getAudioTracks();
-                              if (audioTracks.length) {
-                                const newMuted = !mutedCameras[cam.id];
-                                audioTracks.forEach(
-                                  (t) => (t.enabled = !newMuted),
-                                );
-                                setMutedCameras((prev) => ({
-                                  ...prev,
-                                  [cam.id]: newMuted,
-                                }));
-                              }
-                            }}
-                            className={`px-2 py-1 rounded text-xs font-bold transition ${mutedCameras[cam.id] ? "bg-red-600 hover:bg-red-500 text-white" : "bg-gray-700 hover:bg-gray-600 text-gray-200"}`}
-                          >
-                            {mutedCameras[cam.id] ? "Unmute" : "Mute"}
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-
-                  <h3 className="font-bold text-sm text-gray-400 uppercase mt-6">
-                    Commentary Mic
-                  </h3>
-                  {commentaryActive ? (
-                    <div
-                      className={`bg-gray-800 rounded-lg p-3 space-y-2 border transition ${activeAudioSource === "commentary" && !commentaryMuted ? "border-green-500/50" : "border-transparent"}`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex flex-col">
-                          <span className="text-sm font-medium">
-                            Commentary Mic
-                          </span>
-                          <span className="text-xs mt-1">
-                            {commentaryMuted ? (
-                              <span className="text-red-400 font-semibold">
-                                Muted
-                              </span>
-                            ) : activeAudioSource === "commentary" ? (
-                              <span className="text-green-400 font-bold">
-                                Main Voice (Highlighted)
-                              </span>
-                            ) : (
-                              <span className="text-indigo-400">
-                                Ducked (Background)
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                        <button
-                          onClick={toggleCommentaryMute}
-                          className={`px-3 py-1 rounded text-xs font-bold transition ${commentaryMuted ? "bg-red-600 hover:bg-red-500 text-white" : "bg-green-600 hover:bg-green-500 text-white"}`}
-                        >
-                          {commentaryMuted ? "Unmute" : "Mute"}
-                        </button>
-                      </div>
-                      <button
-                        onClick={stopCommentary}
-                        className="w-full bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded py-1.5 text-xs transition"
-                      >
-                        Disconnect Mic
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={startCommentary}
-                      className="w-full bg-gray-800 hover:bg-gray-700 rounded-lg p-3 text-sm transition font-semibold"
-                    >
-                      <i className="fa-solid fa-microphone-lines mr-2" />{" "}
-                      Connect Commentary Mic
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {/* Sponsored Ads Panel */}
-              {activePanel === "sponsored" && (
-                <div className="space-y-4">
-                  <h3 className="font-bold text-sm text-gray-400 uppercase">
-                    Sponsored Ads Marketplace
-                  </h3>
-                  {currentSponsoredAd && (
-                    <div className="bg-green-900/40 border border-green-700 rounded-lg p-3 space-y-2">
-                      <p className="text-sm font-bold text-green-200">
-                        Playing: {currentSponsoredAd.ad.title}
-                      </p>
-
-                      <p className="text-xs text-green-100 leading-relaxed">
-                        Complete after playback. Payout will be calculated from
-                        verified Vision Cast platform viewers.
-                      </p>
-
-                      <div className="grid grid-cols-2 gap-2 text-xs">
-                        <div className="bg-black/20 rounded p-2">
-                          <span className="block text-green-100/70">
-                            Est. payout/view
-                          </span>
-                          <strong className="text-green-100">
-                            NRS{" "}
-                            {Number(
-                              currentSponsoredAd.estimatedPayoutPerView || 0,
-                            ).toFixed(2)}
-                          </strong>
-                        </div>
-
-                        <div className="bg-black/20 rounded p-2">
-                          <span className="block text-green-100/70">
-                            Cost/view
-                          </span>
-                          <strong className="text-green-100">
-                            NRS{" "}
-                            {Number(
-                              currentSponsoredAd.costPerView || 0,
-                            ).toFixed(2)}
-                          </strong>
-                        </div>
-                      </div>
-
-                      <button
-                        onClick={() => handleCompleteSponsoredAd()}
-                        className="w-full bg-green-600 hover:bg-green-700 rounded py-2 text-sm font-bold"
-                      >
-                        Complete & Calculate Views
-                      </button>
-                    </div>
-                  )}
-                  {sponsoredAds.length === 0 ? (
-                    <div className="bg-gray-800 rounded-lg p-4 text-center text-gray-400 text-sm">
-                      No approved sponsored ads available yet.
-                    </div>
-                  ) : (
-                    sponsoredAds.map((item) => {
-                      const ad = item.ad || item;
-                      const mediaURL = resolveMediaUrl(
-                        ad.mediaUrl || ad.media_url,
-                      );
-                      return (
-                        <div
-                          key={ad.id}
-                          className="bg-gray-800 rounded-lg p-3 space-y-2"
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <div>
-                              <p className="font-bold text-sm text-white">
-                                {ad.title}
-                              </p>
-                              <p className="text-xs text-gray-400 capitalize">
-                                {ad.type} • est. payout/view NRS{" "}
-                                {Number(
-                                  item.yourPayout ||
-                                    item.estimatedPayoutPerView ||
-                                    ad.creatorPayoutPro ||
-                                    ad.creatorPayoutFree ||
-                                    0,
-                                ).toFixed(2)}
-                              </p>
-
-                              <p className="text-xs text-gray-500">
-                                Budget left: NRS{" "}
-                                {Number(ad.remainingBudget || 0).toFixed(2)} •
-                                CPV: NRS{" "}
-                                {Number(
-                                  ad.costPerView || ad.baseChargePerPlay || 0,
-                                ).toFixed(2)}
-                              </p>
-                            </div>
-                            <span className="text-xs bg-gray-700 rounded px-2 py-1">
-                              {ad.durationSeconds || ad.duration_seconds || 0}s
-                            </span>
-                          </div>
-                          {mediaURL &&
-                            (ad.type === "image" ? (
-                              <img
-                                src={mediaURL}
-                                className="w-full h-24 object-cover rounded border border-gray-700"
-                              />
-                            ) : (
-                              <video
-                                src={mediaURL}
-                                className="w-full h-24 object-cover rounded border border-gray-700"
-                                muted
-                                controls
-                              />
-                            ))}
-                          <button
-                            disabled={
-                              sponsoredAdLoading || !!currentSponsoredAd
-                            }
-                            onClick={() => handlePlaySponsoredAd(item)}
-                            className="w-full bg-red-600 hover:bg-red-700 disabled:bg-gray-700 rounded py-2 text-sm font-bold"
-                          >
-                            Add to Stream
-                          </button>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              )}
-
-              {/* Destinations Panel */}
-              {activePanel === "destinations" && (
-                <div className="space-y-4">
-                  <h3 className="font-bold text-sm text-gray-400 uppercase">
-                    Add Stream Destination
-                  </h3>
-                  <div className="bg-gray-800 rounded-lg p-3 space-y-2">
-                    <select
-                      value={newDest.platform}
-                      onChange={(e) =>
-                        setNewDest({ ...newDest, platform: e.target.value })
-                      }
-                      className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                    >
-                      {PLATFORM_OPTIONS.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.label}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      type="text"
-                      placeholder="Stream Key"
-                      value={newDest.stream_key}
-                      onChange={(e) =>
-                        setNewDest({ ...newDest, stream_key: e.target.value })
-                      }
-                      className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                    />
-                    {newDest.platform === "custom" && (
-                      <input
-                        type="text"
-                        placeholder="RTMP Server URL"
-                        value={newDest.server_url}
-                        onChange={(e) =>
-                          setNewDest({ ...newDest, server_url: e.target.value })
-                        }
-                        className="w-full bg-gray-700 text-white rounded px-3 py-2 text-sm"
-                      />
-                    )}
-                    <button
-                      onClick={handleAddDestination}
-                      className="w-full bg-red-600 hover:bg-red-700 rounded py-2 text-sm font-bold"
-                    >
-                      Add Destination
-                    </button>
-                  </div>
-                  <h3 className="font-bold text-sm text-gray-400 uppercase mt-4">
-                    Active Destinations
-                  </h3>
-                  {destinations.map((dest) => (
-                    <div
-                      key={dest.id}
-                      className="bg-gray-800 rounded-lg p-3 flex items-center justify-between"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="vc-platform-icon">
-                          {dest.platform === "youtube" && (
-                            <i className="fa-brands fa-youtube" />
-                          )}
-                          {dest.platform === "facebook" && (
-                            <i className="fa-brands fa-facebook" />
-                          )}
-                          {dest.platform === "twitch" && (
-                            <i className="fa-brands fa-twitch" />
-                          )}
-                          {dest.platform === "custom" && (
-                            <i className="fa-solid fa-plug" />
-                          )}
-                        </span>
-                        <span className="text-sm font-medium capitalize">
-                          {dest.platform}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => toggleDestinationActive(dest)}
-                          className={`px-3 py-1 rounded text-xs font-bold ${dest.is_active ? "bg-green-600" : "bg-gray-700"}`}
-                        >
-                          {dest.is_active ? "ON" : "OFF"}
-                        </button>
-                        <button
-                          onClick={() => handleDeleteDestination(dest.id)}
-                          className="text-red-400 hover:text-red-300 text-xs"
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="vc-share-card space-y-3">
-              <div>
-                <p className="text-xs text-zinc-500 font-bold uppercase tracking-wider mb-2">
-                  Share Watch Link
-                </p>
-                <div className="vc-share-row">
-                  <input
-                    type="text"
-                    readOnly
-                    value={`${window.location.origin}/watch/${eventCode}`}
-                    className="text-xs"
-                  />
-                  <button
-                    onClick={() =>
-                      navigator.clipboard.writeText(
-                        `${window.location.origin}/watch/${eventCode}`,
-                      )
-                    }
-                    className="vc-copy-btn"
-                    title="Copy watch link"
-                  >
-                    <i className="fa-solid fa-copy" />
-                  </button>
-                </div>
-              </div>
-
-              <div>
-                <p className="text-xs text-zinc-500 font-bold uppercase tracking-wider mb-2">
-                  Camera Join Link
-                </p>
-                <div className="vc-share-row">
-                  <input
-                    type="text"
-                    readOnly
-                    value={`${window.location.origin}/camera?session=${eventCode}`}
-                    className="text-xs"
-                  />
-                  <button
-                    onClick={() =>
-                      navigator.clipboard.writeText(
-                        `${window.location.origin}/camera?session=${eventCode}`,
-                      )
-                    }
-                    className="vc-copy-btn"
-                    title="Copy camera link"
-                  >
-                    <i className="fa-solid fa-copy" />
-                  </button>
-                </div>
-              </div>
-            </div>
-          </aside>
-        </div>
-      </div>
-    </>
-  );
+  const studioUi = {
+    eventCode,
+    navigate,
+    canvasRef,
+    cameraVideosRef,
+    peerConnectionsRef,
+    viewerPeerConnectionsRef,
+    iceCandidateQueuesRef,
+    mediaRecorderRef,
+    commentaryStreamRef,
+    streamWSRef,
+    frameRequestRef,
+    clientIdRef,
+    isLiveRef,
+    finalStreamRef,
+    mediaElementsRef,
+    cricketBallLogsRef,
+    audioContextRef,
+    mixerDestinationRef,
+    audioSourcesRef,
+    timerWorkerRef,
+    screenShareStreamRef,
+    cameraRecordersRef,
+    cameraRecordersIntervalsRef,
+    recordingDirHandleRef,
+    hlsInstancesRef,
+    autoSwitchEnabledRef,
+    lastSwitchTimeRef,
+    analyserNodesRef,
+    prevFrameDataRef,
+    autoSwitchIntervalRef,
+    autoSwitchBusyRef,
+    camerasRef,
+    activeCameraIdRef,
+    autoSwitchModeRef,
+    faceDetectorRef,
+    faceDetectorLoadingRef,
+    aiDirectorStatusRef,
+    faceScoresRef,
+    faceDetectionTimeRef,
+    autoSwitchScoresRef,
+    autoSwitchEnabled,
+    setAutoSwitchEnabled,
+    autoSwitchMode,
+    setAutoSwitchMode,
+    aiDirectorStatus,
+    setAiDirectorStatus,
+    aiDirectorScores,
+    setAiDirectorScores,
+    cameras,
+    setCameras,
+    activeCameraId,
+    setActiveCameraId,
+    activeLayout,
+    setActiveLayout,
+    slotAssignments,
+    setSlotAssignments,
+    mutedCameras,
+    setMutedCameras,
+    activeAudioSource,
+    setActiveAudioSource,
+    commentaryActive,
+    setCommentaryActive,
+    commentaryMuted,
+    setCommentaryMuted,
+    isLive,
+    setIsLive,
+    viewerCount,
+    setViewerCount,
+    liveStartTime,
+    setLiveStartTime,
+    overlays,
+    setOverlays,
+    activeOverlays,
+    setActiveOverlays,
+    newOverlay,
+    setNewOverlay,
+    newOverlayMedia,
+    setNewOverlayMedia,
+    scorecardData,
+    setScorecardData,
+    destinations,
+    setDestinations,
+    newDest,
+    setNewDest,
+    eventData,
+    setEventData,
+    activePanel,
+    setActivePanel,
+    elapsed,
+    setElapsed,
+    downloadEnabled,
+    setDownloadEnabled,
+    isScreenSharing,
+    setIsScreenSharing,
+    cameraZoom,
+    setCameraZoom,
+    newOverlayVideoUrl,
+    setNewOverlayVideoUrl,
+    sponsoredAds,
+    setSponsoredAds,
+    currentSponsoredAd,
+    setCurrentSponsoredAd,
+    sponsoredAdLoading,
+    setSponsoredAdLoading,
+    isConnected,
+    clientID,
+    send,
+    on,
+    off,
+    drawVideoFit,
+    drawCameraFeed,
+    cleanupAutoSwitchForCamera,
+    getAudioLevel,
+    getMotionScore,
+    setupAnalyserForCamera,
+    initAiDirectorModel,
+    getFacePresenceScore,
+    buildDirectorScore,
+    runAutoSwitch,
+    toggleAutoSwitch,
+    getResolvedSlots,
+    renderOverlay,
+    startWebSocketStreaming,
+    requestMicrophone,
+    syncMixer,
+    startCanvasCapture,
+    handleOffer,
+    handleCandidate,
+    handleViewerReady,
+    handleAnswer,
+    handleClientJoined,
+    handleClientLeft,
+    handleCameraZoom,
+    goLive,
+    endLive,
+    startCommentary,
+    stopCommentary,
+    toggleCommentaryMute,
+    changeLayout,
+    handleCreateOverlay,
+    toggleOverlayActive,
+    handleDeleteOverlay,
+    startScreenShare,
+    stopScreenShare,
+    enableLocalRecording,
+    startPerCameraRecording,
+    disableLocalRecording,
+    addDelivery,
+    handlePlaySponsoredAd,
+    handleCompleteSponsoredAd,
+    handleAddDestination,
+    toggleDestinationActive,
+    handleDeleteDestination,
+    STREAM_WIDTH,
+    STREAM_HEIGHT
+  };
+
+  return <StudioLayout studio={studioUi} />;
 }
