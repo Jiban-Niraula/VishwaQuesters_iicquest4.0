@@ -1,4 +1,5 @@
 import { LAYOUTS, OVERLAY_TYPES, OVERLAY_POSITIONS, PLATFORM_OPTIONS } from "./studioConstants";
+import { resolveMediaUrl } from "../../services/api";
 
 export default function StudioSidebar({ studio }) {
   const {
