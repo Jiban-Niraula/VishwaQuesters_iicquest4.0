@@ -5,3 +5,5 @@ ffmpeg_log_*.txt
 output.flv
 uploads/
 tmp/
+
+build/*
