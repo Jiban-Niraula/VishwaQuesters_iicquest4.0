@@ -117,35 +117,35 @@ type Ad struct {
 
 	Status string `gorm:"not null;default:'pending'" json:"status"` // pending | approved | rejected | completed
 
-	// Pricing model:
-	// CampaignBudget is the amount company reserves.
-	// RemainingBudget is unspent budget.
-	// SpentAmount is actual consumed budget from billable platform views.
+	// Campaign / pricing fields
 	CampaignBudget float64 `gorm:"not null;default:0" json:"campaignBudget"`
-	ChargeAmount   float64 `gorm:"not null;default:0" json:"chargeAmount"` // kept for old UI/backward compatibility
+	ChargeAmount   float64 `gorm:"not null;default:0" json:"chargeAmount"`
 	SpentAmount    float64 `gorm:"not null;default:0" json:"spentAmount"`
 
-	// CostPerView is the actual billable rate for Vision Cast platform views.
-	// BaseChargePerPlay is kept for backward compatibility and mirrors CostPerView.
 	CostPerView       float64 `gorm:"not null;default:0" json:"costPerView"`
 	BaseChargePerPlay float64 `gorm:"not null;default:0" json:"baseChargePerPlay"`
 
-	// Running totals earned by platform/admin/creators.
 	AdminCommission   float64 `gorm:"not null;default:0" json:"adminCommission"`
-	CreatorPayoutPro  float64 `gorm:"not null;default:0" json:"creatorPayoutPro"`  // pro payout per view
-	CreatorPayoutFree float64 `gorm:"not null;default:0" json:"creatorPayoutFree"` // free payout per view
+	CreatorPayoutPro  float64 `gorm:"not null;default:0" json:"creatorPayoutPro"`
+	CreatorPayoutFree float64 `gorm:"not null;default:0" json:"creatorPayoutFree"`
 
-	MaxPlays        int     `gorm:"not null;default:1000000" json:"maxPlays"` // safety cap only
+	MaxPlays        int     `gorm:"not null;default:1000000" json:"maxPlays"`
 	CompletedPlays  int     `gorm:"not null;default:0" json:"completedPlays"`
 	RemainingBudget float64 `gorm:"not null;default:0" json:"remainingBudget"`
+	EstimatedViews  int     `gorm:"not null;default:0" json:"estimatedViews"`
 
-	EstimatedViews int `gorm:"not null;default:0" json:"estimatedViews"`
-
-	// Analytics totals
 	PlatformViews int `gorm:"not null;default:0" json:"platformViews"`
 	YoutubeViews  int `gorm:"not null;default:0" json:"youtubeViews"`
 	FacebookViews int `gorm:"not null;default:0" json:"facebookViews"`
 	TotalViews    int `gorm:"not null;default:0" json:"totalViews"`
+
+	// AI moderation fields
+	AIModerationStatus string     `gorm:"not null;default:'pending'" json:"aiModerationStatus"` // approved | pending | rejected
+	AIRiskScore        float64    `gorm:"not null;default:0" json:"aiRiskScore"`
+	AIModerationReason string     `gorm:"type:text" json:"aiModerationReason,omitempty"`
+	AIModerationLabels string     `gorm:"type:text" json:"aiModerationLabels,omitempty"` // JSON string
+	AIModerationBy     string     `gorm:"not null;default:'local-ai-moderator'" json:"aiModerationBy"`
+	AIModeratedAt      *time.Time `json:"aiModeratedAt,omitempty"`
 
 	AdPlacements []AdPlacement `gorm:"foreignKey:AdID" json:"adPlacements,omitempty"`
 

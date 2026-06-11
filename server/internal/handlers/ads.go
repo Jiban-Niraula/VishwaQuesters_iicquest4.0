@@ -48,6 +48,13 @@ func CreateAd(c *gin.Context) {
 		return
 	}
 
+	moderation := services.ModerateAd(services.AdModerationInput{
+		Title:           input.Title,
+		Type:            input.Type,
+		MediaURL:        input.MediaURL,
+		DurationSeconds: input.DurationSeconds,
+	})
+
 	ad, pricing, err := createCompanyAd(
 		userID,
 		input.Title,
@@ -57,6 +64,7 @@ func CreateAd(c *gin.Context) {
 		input.ThumbnailURL,
 		input.CampaignBudget,
 		input.MaxPlays,
+		moderation,
 	)
 
 	if err != nil {
@@ -64,12 +72,18 @@ func CreateAd(c *gin.Context) {
 		return
 	}
 
+	message := "Ad created and auto-approved by AI moderation."
+	if ad.Status == "pending" {
+		message = "Ad created. AI moderation flagged it for admin review."
+	}
+
 	c.JSON(http.StatusCreated, gin.H{
 		"ad":             ad,
 		"campaignBudget": pricing.CampaignBudget,
 		"costPerView":    pricing.CostPerView,
 		"estimatedViews": pricing.EstimatedViews,
-		"message":        "Ad created. Campaign budget reserved from wallet. Pending admin approval.",
+		"aiModeration":   moderation,
+		"message":        message,
 	})
 }
 
@@ -126,6 +140,16 @@ func UploadAd(c *gin.Context) {
 
 	mediaURL := "/uploads/ads/" + filename
 
+	moderation := services.ModerateAd(services.AdModerationInput{
+		Title:           title,
+		Type:            adType,
+		MediaURL:        mediaURL,
+		FileName:        file.Filename,
+		ContentType:     file.Header.Get("Content-Type"),
+		FileSize:        file.Size,
+		DurationSeconds: durationSeconds,
+	})
+
 	ad, pricing, err := createCompanyAd(
 		userID,
 		title,
@@ -135,11 +159,17 @@ func UploadAd(c *gin.Context) {
 		thumbnailURL,
 		campaignBudget,
 		maxPlays,
+		moderation,
 	)
 
 	if err != nil {
 		writeCreateAdError(c, err)
 		return
+	}
+
+	message := "Ad uploaded and auto-approved by AI moderation."
+	if ad.Status == "pending" {
+		message = "Ad uploaded. AI moderation flagged it for admin review."
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
@@ -148,7 +178,8 @@ func UploadAd(c *gin.Context) {
 		"campaignBudget": pricing.CampaignBudget,
 		"costPerView":    pricing.CostPerView,
 		"estimatedViews": pricing.EstimatedViews,
-		"message":        "Ad uploaded. Campaign budget reserved from wallet. Pending admin approval.",
+		"aiModeration":   moderation,
+		"message":        message,
 	})
 }
 
@@ -160,7 +191,10 @@ func ListMyAds(c *gin.Context) {
 	}
 
 	var ads []models.Ad
-	db.Preload("AdPlacements").Where("company_id = ?", userID).Order("created_at DESC").Find(&ads)
+	db.Preload("AdPlacements").
+		Where("company_id = ?", userID).
+		Order("created_at DESC").
+		Find(&ads)
 
 	c.JSON(http.StatusOK, gin.H{"ads": ads})
 }
@@ -259,7 +293,7 @@ func PlayAd(c *gin.Context) {
 		"estimatedPayoutPerView": services.GetCreatorPayout(ad, creatorPlan),
 		"creatorPlan":            creatorPlan,
 		"eventCode":              eventCode,
-		"message":                "Sponsored ad started. Complete it to calculate verified platform views and payout.",
+		"message":                "Sponsored ad started.",
 	})
 }
 
@@ -320,9 +354,6 @@ func CompleteAdPlacement(c *gin.Context) {
 		youtubeViews := maxInt(0, input.YoutubeViews)
 		facebookViews := maxInt(0, input.FacebookViews)
 
-		// MVP rule:
-		// Only Vision Cast platform views are billable.
-		// YouTube/Facebook views are report-only until API verification exists.
 		billableViews := platformViews
 		chargedAmount := roundMoney(float64(billableViews) * ad.CostPerView)
 
@@ -479,6 +510,7 @@ func createCompanyAd(
 	thumbnailURL string,
 	campaignBudget float64,
 	maxPlays int,
+	moderation services.AdModerationResult,
 ) (models.Ad, services.AdPricing, error) {
 	pricing, err := services.CalculateAdCampaignPricing(db, adType, durationSeconds, campaignBudget, maxPlays)
 	if err != nil {
@@ -497,6 +529,11 @@ func createCompanyAd(
 			return ErrInsufficientBalance
 		}
 
+		status := "approved"
+		if moderation.Status != "approved" {
+			status = "pending"
+		}
+
 		ad = models.Ad{
 			CompanyID:       userID,
 			Title:           title,
@@ -504,7 +541,7 @@ func createCompanyAd(
 			MediaURL:        normalizePath(mediaURL),
 			DurationSeconds: durationSeconds,
 			ThumbnailURL:    normalizePath(thumbnailURL),
-			Status:          "pending",
+			Status:          status,
 
 			CampaignBudget:  pricing.CampaignBudget,
 			ChargeAmount:    pricing.CampaignBudget,
@@ -521,14 +558,19 @@ func createCompanyAd(
 			MaxPlays:       pricing.MaxPlays,
 			CompletedPlays: 0,
 			EstimatedViews: pricing.EstimatedViews,
+
+			AIModerationStatus: moderation.Status,
+			AIRiskScore:        moderation.RiskScore,
+			AIModerationReason: moderation.Reason,
+			AIModerationLabels: services.ModerationLabelsJSON(moderation.Labels),
+			AIModerationBy:     moderation.Provider,
+			AIModeratedAt:      &moderation.CheckedAt,
 		}
 
 		if err := tx.Create(&ad).Error; err != nil {
 			return err
 		}
 
-		// Reserve the full campaign budget from company wallet.
-		// Admin/creator only receive money when ad gets verified platform views.
 		if err := debitWalletWithDB(
 			tx,
 			wallet.ID,
@@ -597,8 +639,20 @@ func writeCreateAdError(c *gin.Context, err error) {
 
 func validateAdFile(file *multipart.FileHeader, adType string) error {
 	ext := strings.ToLower(filepath.Ext(file.Filename))
-	imageExt := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true}
-	videoExt := map[string]bool{".mp4": true, ".webm": true, ".mov": true}
+
+	imageExt := map[string]bool{
+		".jpg":  true,
+		".jpeg": true,
+		".png":  true,
+		".webp": true,
+		".gif":  true,
+	}
+
+	videoExt := map[string]bool{
+		".mp4":  true,
+		".webm": true,
+		".mov":  true,
+	}
 
 	if adType == "image" && !imageExt[ext] {
 		return errors.New("image ads must be jpg, jpeg, png, webp, or gif")
@@ -643,9 +697,11 @@ func clampPercentLocal(v float64) float64 {
 	if v < 0 {
 		return 0
 	}
+
 	if v > 100 {
 		return 100
 	}
+
 	return v
 }
 

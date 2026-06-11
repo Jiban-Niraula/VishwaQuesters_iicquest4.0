@@ -92,7 +92,7 @@ export default function CompanyCreateAd() {
   return (
     <DashboardLayout
       title="Create Ad Campaign"
-      subtitle="Set a campaign budget. Spend is consumed only when verified Vision Cast platform viewers see the ad."
+      subtitle="Upload your campaign. AI moderation auto-approves safe ads and flags risky ads for admin review."
       actions={
         <Link className="btn btn-secondary" to="/company/ads">
           <i className="fa-solid fa-arrow-left" /> Ads

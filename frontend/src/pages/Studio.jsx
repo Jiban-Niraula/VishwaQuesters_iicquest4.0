@@ -55,30 +55,68 @@ const PLATFORM_OPTIONS = [
   { id: "custom", label: "Custom RTMP" },
 ];
 
-const ICE_SERVERS = {
-  iceServers: [
+function buildIceServers() {
+  const iceServers = [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-  ],
-};
+  ];
+
+  const turnUrlsRaw =
+    import.meta.env.VITE_TURN_URLS || import.meta.env.VITE_TURN_URL;
+
+  const turnUsername = import.meta.env.VITE_TURN_USERNAME;
+  const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
+
+  if (turnUrlsRaw && turnUsername && turnCredential) {
+    const turnUrls = String(turnUrlsRaw)
+      .split(",")
+      .map((url) => url.trim())
+      .filter(Boolean);
+
+    iceServers.push({
+      urls: turnUrls,
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return {
+    iceServers,
+    iceCandidatePoolSize: 10,
+    iceTransportPolicy:
+      import.meta.env.VITE_FORCE_TURN === "true" ? "relay" : "all",
+  };
+}
+
+const ICE_SERVERS = buildIceServers();
+
+console.log("ICE_SERVERS:", ICE_SERVERS);
+const STREAM_WIDTH = 1280;
+const STREAM_HEIGHT = 720;
+const STREAM_FPS = 24;
+const RECORDER_CHUNK_MS = 250;
+const STREAM_VIDEO_BITRATE = 2_500_000;
+const STREAM_AUDIO_BITRATE = 128_000;
 
 const getSupportedMimeType = () => {
-  // Prioritize H.264 for YouTube compatibility
+  // For browser MediaRecorder → FFmpeg pipe, VP8 WebM is usually more stable.
+  // Backend FFmpeg will convert this to H.264 for YouTube/Facebook.
   const types = [
-    "video/webm;codecs=h264,opus", // H.264 + Opus
-    "video/mp4;codecs=h264,aac", // MP4 with H.264 + AAC
-    "video/webm;codecs=vp8,opus", // Fallback to VP8
+    "video/webm;codecs=vp8,opus",
+    "video/webm;codecs=vp9,opus",
+    "video/webm",
   ];
 
   for (const type of types) {
     if (MediaRecorder.isTypeSupported(type)) {
-      console.log(`✅ Using MediaRecorder MIME type: ${type}`);
+      console.log(`✅ Using stable MediaRecorder MIME type: ${type}`);
       return type;
     }
   }
+
+  console.warn(
+    "⚠️ No preferred MediaRecorder type supported. Using browser default.",
+  );
   return "";
 };
 
@@ -173,7 +211,22 @@ export default function Studio() {
 
   // Draw video maintaining aspect ratio (with optional digital zoom)
   const drawVideoFit = useCallback((ctx, video, x, y, w, h, zoom = 1) => {
-    if (!video || video.readyState < 2) {
+    if (!video) {
+      ctx.fillStyle = "#0D1318";
+      ctx.fillRect(x, y, w, h);
+      return;
+    }
+
+    // Try to force hidden video playback if stream is attached but not playing yet.
+    if (video.srcObject && video.paused) {
+      video.play().catch(() => {});
+    }
+
+    if (
+      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      !video.videoWidth ||
+      !video.videoHeight
+    ) {
       ctx.fillStyle = "#0D1318";
       ctx.fillRect(x, y, w, h);
       return;
@@ -182,7 +235,6 @@ export default function Studio() {
     const vW = video.videoWidth;
     const vH = video.videoHeight;
 
-    // Digital zoom: crop source rectangle centered on the video
     const safeZoom = Math.max(1, Math.min(zoom, 4));
     const srcW = vW / safeZoom;
     const srcH = vH / safeZoom;
@@ -191,7 +243,11 @@ export default function Studio() {
 
     const videoRatio = srcW / srcH;
     const boxRatio = w / h;
-    let drawW, drawH, drawX, drawY;
+
+    let drawW;
+    let drawH;
+    let drawX;
+    let drawY;
 
     if (videoRatio > boxRatio) {
       drawW = w;
@@ -206,9 +262,7 @@ export default function Studio() {
     }
 
     ctx.save();
-    // Enhance visual quality before capturing stream
-    ctx.filter =
-      "contrast(1.1) saturate(1.2) brightness(1.05) hue-rotate(-2deg)";
+    ctx.filter = "contrast(1.08) saturate(1.12) brightness(1.03)";
     ctx.drawImage(video, srcX, srcY, srcW, srcH, drawX, drawY, drawW, drawH);
     ctx.restore();
   }, []);
@@ -216,38 +270,51 @@ export default function Studio() {
   // Draw camera feed with premium HUD labels and fallbacks
   const drawCameraFeed = useCallback(
     (ctx, camera, label, x, y, w, h) => {
+      const video = camera?.videoElement;
+
       if (
         camera &&
-        camera.videoElement &&
-        camera.videoElement.readyState >= 2
+        video &&
+        video.srcObject &&
+        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        video.videoWidth > 0 &&
+        video.videoHeight > 0
       ) {
         const zoom = cameraZoom[camera.id] || 1;
-        drawVideoFit(ctx, camera.videoElement, x, y, w, h, zoom);
-        // Removed camera name label overlay per user request
-      } else {
-        // Premium broadcast placeholder
-        ctx.save();
-        ctx.fillStyle = "#090D11";
-        ctx.fillRect(x, y, w, h);
-
-        // Subtle grid-dashed border outline
-        ctx.strokeStyle = "#1E293B";
-        ctx.lineWidth = 2;
-        ctx.setLineDash([8, 8]);
-        ctx.strokeRect(x + 12, y + 12, w - 24, h - 24);
-
-        // Label text centered
-        ctx.fillStyle = "#475569";
-        ctx.font = "bold 15px 'DM Sans', sans-serif";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(label || "Offline Feed", x + w / 2, y + h / 2 - 10);
-
-        ctx.font = "11px 'DM Sans', sans-serif";
-        ctx.fillStyle = "#334155";
-        ctx.fillText("Waiting for connection...", x + w / 2, y + h / 2 + 12);
-        ctx.restore();
+        drawVideoFit(ctx, video, x, y, w, h, zoom);
+        return;
       }
+
+      // If stream exists but video is still paused, keep trying.
+      if (video?.srcObject && video.paused) {
+        video.play().catch(() => {});
+      }
+
+      ctx.save();
+      ctx.fillStyle = "#090D11";
+      ctx.fillRect(x, y, w, h);
+
+      ctx.strokeStyle = "#1E293B";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 8]);
+      ctx.strokeRect(x + 12, y + 12, w - 24, h - 24);
+
+      ctx.fillStyle = "#475569";
+      ctx.font = "bold 15px 'DM Sans', sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(label || "Offline Feed", x + w / 2, y + h / 2 - 10);
+
+      ctx.font = "11px 'DM Sans', sans-serif";
+      ctx.fillStyle = "#334155";
+
+      const trackInfo = camera?.stream
+        ? `tracks: video=${camera.stream.getVideoTracks().length}, audio=${camera.stream.getAudioTracks().length}`
+        : "Waiting for connection.";
+
+      ctx.fillText(trackInfo, x + w / 2, y + h / 2 + 12);
+
+      ctx.restore();
     },
     [drawVideoFit, cameraZoom],
   );
@@ -690,7 +757,6 @@ export default function Studio() {
   }, []);
 
   // Start WebSocket streaming to backend
-  // Start WebSocket streaming to backend
   const startWebSocketStreaming = useCallback(
     async (stream) => {
       const token = localStorage.getItem("streamangle_token");
@@ -750,7 +816,6 @@ export default function Studio() {
         });
       };
 
-      // Close old RTMP sockets before starting a new recorder.
       if (streamWSRef.current?.close) {
         streamWSRef.current.close();
       }
@@ -806,41 +871,12 @@ export default function Studio() {
         },
       };
 
-      console.log(
-        `[RTMP WS] Ready. Sending one MediaRecorder stream to ${openSockets.length} destination(s).`,
-      );
-
-      const mimeTypes = [
-        "video/webm;codecs=vp8,opus",
-        "video/webm;codecs=vp9,opus",
-        "video/webm",
-      ];
-
-      let selectedMime = "";
-
-      for (const mime of mimeTypes) {
-        if (MediaRecorder.isTypeSupported(mime)) {
-          selectedMime = mime;
-          break;
-        }
-      }
-
-      console.log(
-        `Using MediaRecorder mimeType: ${selectedMime || "browser default"}`,
-      );
-
-      const audioTracks = stream.getAudioTracks();
-
-      audioTracks.forEach((track) => {
-        track.enabled = true;
-      });
+      const selectedMime = getSupportedMimeType();
 
       const wsStream = new MediaStream();
 
-      // Use a fresh canvas capture track for RTMP so viewer WebRTC does not freeze.
       if (canvasRef.current) {
-        const freshCanvasStream = canvasRef.current.captureStream(30);
-
+        const freshCanvasStream = canvasRef.current.captureStream(STREAM_FPS);
         freshCanvasStream.getVideoTracks().forEach((track) => {
           wsStream.addTrack(track);
         });
@@ -850,7 +886,8 @@ export default function Studio() {
         });
       }
 
-      audioTracks.forEach((track) => {
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
         wsStream.addTrack(track);
       });
 
@@ -859,8 +896,8 @@ export default function Studio() {
       );
 
       const recorderOptions = {
-        videoBitsPerSecond: 4_500_000,
-        audioBitsPerSecond: 160_000,
+        videoBitsPerSecond: STREAM_VIDEO_BITRATE,
+        audioBitsPerSecond: STREAM_AUDIO_BITRATE,
       };
 
       if (selectedMime) {
@@ -869,24 +906,20 @@ export default function Studio() {
 
       const mediaRecorder = new MediaRecorder(wsStream, recorderOptions);
 
-      mediaRecorder.ondataavailable = (event) => {
+      mediaRecorder.ondataavailable = async (event) => {
         if (!event.data || event.data.size === 0) return;
+
+        const buffer = await event.data.arrayBuffer();
 
         openSockets.forEach(({ id, ws }) => {
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(event.data);
+            ws.send(buffer);
           } else {
             console.warn(
               `[RTMP WS] Destination ${id} socket not open, chunk skipped`,
             );
           }
         });
-
-        if (Math.random() < 0.1) {
-          console.log(
-            `[RTMP WS] Chunk ${event.data.size} bytes sent to ${openSockets.length} destination(s)`,
-          );
-        }
       };
 
       mediaRecorder.onerror = (event) => {
@@ -901,9 +934,13 @@ export default function Studio() {
         }
       };
 
-      // 1000ms chunks are easier for FFmpeg to keep live.
-      mediaRecorder.start(1000);
+      // Smaller chunks prevent burst/pause/burst behavior.
+      mediaRecorder.start(RECORDER_CHUNK_MS);
       mediaRecorderRef.current = mediaRecorder;
+
+      console.log(
+        `[RTMP WS] Started stable recorder: ${STREAM_WIDTH}x${STREAM_HEIGHT}, ${STREAM_FPS}fps, chunk=${RECORDER_CHUNK_MS}ms`,
+      );
 
       return true;
     },
@@ -1212,45 +1249,109 @@ export default function Studio() {
   const handleOffer = useCallback(
     async (msg) => {
       const cameraID = msg.from;
-      const offer = msg.data.offer;
+      const offer = msg.data?.offer;
 
-      if (peerConnectionsRef.current[cameraID]) {
-        console.log(`Already processing camera ${cameraID}`);
+      if (!cameraID || !offer) {
+        console.warn("Invalid camera offer:", msg);
         return;
       }
 
+      // If the same camera reconnects, clean old connection first.
+      if (peerConnectionsRef.current[cameraID]) {
+        try {
+          peerConnectionsRef.current[cameraID].close();
+        } catch {}
+        delete peerConnectionsRef.current[cameraID];
+      }
+
       let video = cameraVideosRef.current[cameraID];
+
       if (!video) {
         video = document.createElement("video");
         video.autoplay = true;
         video.playsInline = true;
         video.muted = true;
+        video.controls = false;
         video.id = `camera-${cameraID}`;
+        video.style.position = "fixed";
+        video.style.left = "-99999px";
+        video.style.top = "-99999px";
+        video.style.width = "1px";
+        video.style.height = "1px";
+        video.style.opacity = "0";
         document.body.appendChild(video);
         cameraVideosRef.current[cameraID] = video;
       }
+
+      const remoteStream = new MediaStream();
+
+      const registerCamera = () => {
+        setCameras((prev) => ({
+          ...prev,
+          [cameraID]: {
+            id: cameraID,
+            stream: remoteStream,
+            videoElement: video,
+            _audioTrackCount: remoteStream.getAudioTracks().length,
+            _videoTrackCount: remoteStream.getVideoTracks().length,
+            type: msg.data?.camera_type || "phone",
+            deviceName: msg.data?.device_name || "Camera",
+          },
+        }));
+
+        setActiveCameraId((prev) => prev || cameraID);
+      };
+
+      const tryPlayVideo = async () => {
+        try {
+          if (video.srcObject !== remoteStream) {
+            video.srcObject = remoteStream;
+          }
+
+          await video.play();
+          registerCamera();
+
+          console.log(
+            `✅ Studio video playing for ${cameraID}: video=${remoteStream.getVideoTracks().length}, audio=${remoteStream.getAudioTracks().length}, readyState=${video.readyState}`,
+          );
+        } catch (err) {
+          console.warn(`Video play pending for ${cameraID}:`, err);
+          registerCamera();
+        }
+      };
+
+      video.onloadedmetadata = tryPlayVideo;
+      video.oncanplay = tryPlayVideo;
+      video.onplaying = registerCamera;
 
       const pc = new RTCPeerConnection(ICE_SERVERS);
       peerConnectionsRef.current[cameraID] = pc;
       iceCandidateQueuesRef.current[cameraID] = [];
 
-      // Helper: directly connect an audio track to the Web Audio mixer WITHOUT
-      // going through React state. This is synchronous and happens the instant
-      // the track arrives — bypassing the setCameras→re-render→syncMixer chain.
+      pc.onicecandidateerror = (event) => {
+        console.error("[ICE ERROR]", {
+          url: event.url,
+          errorCode: event.errorCode,
+          errorText: event.errorText,
+          address: event.address,
+          port: event.port,
+        });
+      };
       const connectAudioTrackToMixer = (audioTrack) => {
-        // Initialize AudioContext on first use
         if (!audioContextRef.current) {
           const AudioContextClass =
             window.AudioContext || window.webkitAudioContext;
+
           if (!AudioContextClass) {
             console.error("Web Audio API not supported");
             return;
           }
+
           try {
             audioContextRef.current = new AudioContextClass();
             mixerDestinationRef.current =
               audioContextRef.current.createMediaStreamDestination();
-            console.log("🔊 Web Audio Mixer initialized (from ontrack)");
+            console.log("🔊 Web Audio Mixer initialized from camera track");
           } catch (err) {
             console.error("Failed to init AudioContext:", err);
             return;
@@ -1259,95 +1360,154 @@ export default function Studio() {
 
         const audioCtx = audioContextRef.current;
         const destNode = mixerDestinationRef.current;
+
         if (!audioCtx || !destNode) return;
 
-        // Resume context if suspended (browser autoplay policy)
         if (audioCtx.state === "suspended") {
-          audioCtx
-            .resume()
-            .catch((e) => console.warn("AudioContext resume failed:", e));
+          audioCtx.resume().catch(() => {});
         }
 
-        // Tear down any existing node for this camera before creating a new one
         const existing = audioSourcesRef.current[cameraID];
+
         if (existing) {
           try {
             existing.sourceNode.disconnect();
-          } catch (e) {}
+          } catch {}
           try {
             existing.gainNode.disconnect();
-          } catch (e) {}
+          } catch {}
         }
 
-        // Wrap the raw track in its own MediaStream for createMediaStreamSource
         const audioOnlyStream = new MediaStream([audioTrack]);
+
         try {
           const sourceNode = audioCtx.createMediaStreamSource(audioOnlyStream);
           const gainNode = audioCtx.createGain();
-          gainNode.gain.value = 1.0; // full volume; syncMixer can adjust later
+
+          gainNode.gain.value = 1.0;
+
           sourceNode.connect(gainNode);
           gainNode.connect(destNode);
+
           audioSourcesRef.current[cameraID] = {
             sourceNode,
             gainNode,
             stream: audioOnlyStream,
             audioTrackCount: 1,
           };
-          console.log(
-            `🔊 Camera ${cameraID}: audio track directly wired to mixer`,
-          );
 
-          // Auto-select this camera as active audio source if none chosen yet
           setActiveAudioSource((prev) => prev || cameraID);
-        } catch (err) {
-          console.error(
-            `Failed to connect camera ${cameraID} audio to mixer:`,
-            err,
-          );
-        }
-      };
 
-      // Helper to register / refresh the camera in React state (for UI / video rendering)
-      const registerCamera = (stream) => {
-        setCameras((prev) => ({
-          ...prev,
-          [cameraID]: {
-            id: cameraID,
-            stream: stream,
-            videoElement: video,
-            _audioTrackCount: stream.getAudioTracks().length,
-            type: msg.data.camera_type || "phone",
-            deviceName: msg.data.device_name || "Camera",
-          },
-        }));
-        setActiveCameraId((prev) => prev || cameraID);
+          console.log(`🔊 Audio connected for ${cameraID}`);
+        } catch (err) {
+          console.error(`Failed to connect audio for ${cameraID}:`, err);
+        }
       };
 
       pc.ontrack = (event) => {
-        if (event.streams && event.streams[0]) {
-          const stream = event.streams[0];
-          console.log(
-            `Received track (${event.track.kind}) from ${cameraID} – video: ${stream.getVideoTracks().length}, audio: ${stream.getAudioTracks().length}`,
-          );
+        console.log(
+          `📡 Track received from ${cameraID}: kind=${event.track.kind}, state=${event.track.readyState}`,
+        );
 
-          // ── AUDIO: connect directly to mixer NOW, do not wait for React state ──
-          if (event.track.kind === "audio") {
-            connectAudioTrackToMixer(event.track);
-          }
+        remoteStream.addTrack(event.track);
 
-          // ── VIDEO: attach to hidden <video> element for canvas rendering ──
-          if (!video.srcObject) {
-            video.srcObject = stream;
-            video.play().catch(console.warn);
-            video.onloadedmetadata = () => registerCamera(stream);
-          } else {
-            registerCamera(stream);
-          }
+        if (event.track.kind === "audio") {
+          connectAudioTrackToMixer(event.track);
         }
+
+        if (event.track.kind === "video") {
+          if (video.srcObject !== remoteStream) {
+            video.srcObject = remoteStream;
+          }
+
+          event.track.onunmute = () => {
+            console.log(`✅ Video track unmuted for ${cameraID}`);
+            tryPlayVideo();
+          };
+
+          event.track.onended = () => {
+            console.warn(`⚠️ Video track ended for ${cameraID}`);
+          };
+        }
+
+        registerCamera();
+        tryPlayVideo();
+      };
+
+      let disconnectTimer = null;
+
+      pc.onconnectionstatechange = () => {
+        console.log(`Camera ${cameraID} connectionState:`, pc.connectionState);
+
+        if (pc.connectionState === "connected") {
+          if (disconnectTimer) {
+            clearTimeout(disconnectTimer);
+            disconnectTimer = null;
+          }
+          return;
+        }
+
+        if (pc.connectionState === "disconnected") {
+          if (disconnectTimer) clearTimeout(disconnectTimer);
+
+          disconnectTimer = setTimeout(() => {
+            const currentPc = peerConnectionsRef.current[cameraID];
+
+            if (
+              currentPc &&
+              currentPc.connectionState !== "connected" &&
+              currentPc.connectionState !== "connecting"
+            ) {
+              console.warn(
+                `Camera ${cameraID} still disconnected. Requesting new offer.`,
+              );
+              send("request_offer", {}, cameraID);
+            }
+          }, 8000);
+
+          return;
+        }
+
+        if (
+          pc.connectionState === "failed" ||
+          pc.connectionState === "closed"
+        ) {
+          console.warn(`Camera ${cameraID} failed/closed. Removing camera.`);
+          try {
+            pc.close();
+          } catch {}
+
+          delete peerConnectionsRef.current[cameraID];
+          delete iceCandidateQueuesRef.current[cameraID];
+
+          setCameras((prev) => {
+            const next = { ...prev };
+            delete next[cameraID];
+            return next;
+          });
+
+          send("request_offer", {}, cameraID);
+        }
+      };
+      pc.oniceconnectionstatechange = () => {
+        console.log(
+          `Camera ${cameraID} iceConnectionState:`,
+          pc.iceConnectionState,
+        );
       };
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
+          const raw = event.candidate.candidate || "";
+          const type = raw.match(/ typ ([a-z]+)/)?.[1];
+          const protocol = raw.match(/ udp | tcp /)?.[0]?.trim();
+
+          console.log("[ICE CANDIDATE]", {
+            type,
+            protocol,
+            candidate: raw,
+          });
+
           send("candidate", { candidate: event.candidate }, cameraID);
         }
       };
@@ -1355,7 +1515,6 @@ export default function Studio() {
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
-        // Process queued candidates
         const queued = iceCandidateQueuesRef.current[cameraID] || [];
         for (const candidate of queued) {
           pc.addIceCandidate(candidate).catch(console.error);
@@ -1364,14 +1523,16 @@ export default function Studio() {
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+
         send("answer", { answer }, cameraID);
+
+        console.log(`✅ Answer sent to camera ${cameraID}`);
       } catch (err) {
-        console.error("Error handling offer:", err);
+        console.error("Error handling camera offer:", err);
       }
     },
     [send],
   );
-
   const handleCandidate = useCallback((msg) => {
     const senderID = msg.from;
     const pc =
@@ -1408,6 +1569,16 @@ export default function Studio() {
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
+          const raw = event.candidate.candidate || "";
+          const type = raw.match(/ typ ([a-z]+)/)?.[1];
+          const protocol = raw.match(/ udp | tcp /)?.[0]?.trim();
+
+          console.log("[ICE CANDIDATE]", {
+            type,
+            protocol,
+            candidate: raw,
+          });
+
           send("candidate", { candidate: event.candidate }, viewerID);
         }
       };
@@ -1437,11 +1608,36 @@ export default function Studio() {
     }
   }, []);
 
-  const handleClientJoined = useCallback((msg) => {
-    if (msg.data?.role === "viewer") {
-      setViewerCount((prev) => prev + 1);
-    }
-  }, []);
+  const handleClientJoined = useCallback(
+    (msg) => {
+      if (msg.data?.role === "viewer") {
+        setViewerCount((prev) => prev + 1);
+        return;
+      }
+
+      if (msg.data?.role === "camera") {
+        const cameraID = msg.from;
+
+        console.log(`📷 Camera joined: ${cameraID}`);
+
+        // Ask camera to resend offer if needed.
+        // This fixes cases where the phone joined but Studio missed the first offer.
+        setTimeout(() => {
+          if (!peerConnectionsRef.current[cameraID]) {
+            send(
+              "request_offer",
+              {
+                event_code: eventCode,
+                reason: "studio_request_after_camera_join",
+              },
+              cameraID,
+            );
+          }
+        }, 500);
+      }
+    },
+    [send, eventCode],
+  );
 
   const handleClientLeft = useCallback(
     (msg) => {
@@ -1548,46 +1744,36 @@ export default function Studio() {
   }, [eventCode]);
 
   // Canvas rendering loop — driven by a Web Worker timer so it keeps
-  // running even when this tab is in the background (rAF is throttled
-  // by the browser to ~1 FPS when hidden, causing stream lag).
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
 
-    // Snapshot the latest state values in a ref so the worker tick
-    // callback always has access to the current values without needing
-    // to be recreated on every state change.
-    const stateRef = {
-      cameras,
-      activeCameraId,
-      activeLayout,
-      overlays,
-      activeOverlays,
-      isLive,
-      getResolvedSlots,
-      drawCameraFeed,
-      renderOverlay,
-    };
+    const ctx = canvas.getContext("2d", { alpha: false });
+    let animationId = null;
+    let lastFrameTime = 0;
+    const frameInterval = 1000 / STREAM_FPS;
 
-    const render = () => {
-      const s = stateRef;
-      // Clear canvas
+    const render = (now) => {
+      animationId = requestAnimationFrame(render);
+
+      if (now - lastFrameTime < frameInterval) return;
+      lastFrameTime = now;
+
       ctx.fillStyle = "#080C0F";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      const cameraList = Object.values(s.cameras);
+      const cameraList = Object.values(cameras);
       const {
         slot1: cam1,
         slot2: cam2,
         slot3: cam3,
         slot4: cam4,
-      } = s.getResolvedSlots();
+      } = getResolvedSlots();
 
       if (cameraList.length > 0) {
-        if (s.activeLayout === "single") {
+        if (activeLayout === "single") {
           if (cam1) {
-            s.drawCameraFeed(
+            drawCameraFeed(
               ctx,
               cam1,
               `${cam1.id.split("_")[0]} (Main)`,
@@ -1597,9 +1783,10 @@ export default function Studio() {
               canvas.height,
             );
           }
-        } else if (s.activeLayout === "side-by-side") {
+        } else if (activeLayout === "side-by-side") {
           const halfW = canvas.width / 2;
-          s.drawCameraFeed(
+
+          drawCameraFeed(
             ctx,
             cam1,
             cam1 ? `${cam1.id.split("_")[0]} (Left)` : "Camera 1 (Offline)",
@@ -1608,7 +1795,8 @@ export default function Studio() {
             halfW,
             canvas.height,
           );
-          s.drawCameraFeed(
+
+          drawCameraFeed(
             ctx,
             cam2,
             cam2 ? `${cam2.id.split("_")[0]} (Right)` : "Camera 2 (Offline)",
@@ -1617,10 +1805,11 @@ export default function Studio() {
             halfW,
             canvas.height,
           );
+
           ctx.fillStyle = "#1E293B";
           ctx.fillRect(halfW - 1, 0, 2, canvas.height);
-        } else if (s.activeLayout === "pip") {
-          s.drawCameraFeed(
+        } else if (activeLayout === "pip") {
+          drawCameraFeed(
             ctx,
             cam1,
             cam1 ? `${cam1.id.split("_")[0]} (Main)` : "Camera 1 (Offline)",
@@ -1629,18 +1818,21 @@ export default function Studio() {
             canvas.width,
             canvas.height,
           );
+
           if (cam2) {
-            const pipW = canvas.width / 4,
-              pipH = canvas.height / 4;
-            const pipX = canvas.width - pipW - 20,
-              pipY = canvas.height - pipH - 20;
+            const pipW = canvas.width / 4;
+            const pipH = canvas.height / 4;
+            const pipX = canvas.width - pipW - 20;
+            const pipY = canvas.height - pipH - 20;
+
             ctx.save();
             ctx.shadowColor = "rgba(0,0,0,0.5)";
             ctx.shadowBlur = 15;
             ctx.fillStyle = "#090D11";
             ctx.fillRect(pipX - 2, pipY - 2, pipW + 4, pipH + 4);
             ctx.restore();
-            s.drawCameraFeed(
+
+            drawCameraFeed(
               ctx,
               cam2,
               `${cam2.id.split("_")[0]} (PiP)`,
@@ -1650,10 +1842,11 @@ export default function Studio() {
               pipH,
             );
           }
-        } else if (s.activeLayout === "grid") {
-          const w = canvas.width / 2,
-            h = canvas.height / 2;
-          s.drawCameraFeed(
+        } else if (activeLayout === "grid") {
+          const w = canvas.width / 2;
+          const h = canvas.height / 2;
+
+          drawCameraFeed(
             ctx,
             cam1,
             cam1 ? `${cam1.id.split("_")[0]} (Cam 1)` : "Camera 1 (Offline)",
@@ -1662,7 +1855,8 @@ export default function Studio() {
             w,
             h,
           );
-          s.drawCameraFeed(
+
+          drawCameraFeed(
             ctx,
             cam2,
             cam2 ? `${cam2.id.split("_")[0]} (Cam 2)` : "Camera 2 (Offline)",
@@ -1671,7 +1865,8 @@ export default function Studio() {
             w,
             h,
           );
-          s.drawCameraFeed(
+
+          drawCameraFeed(
             ctx,
             cam3,
             cam3 ? `${cam3.id.split("_")[0]} (Cam 3)` : "Camera 3 (Offline)",
@@ -1680,7 +1875,8 @@ export default function Studio() {
             w,
             h,
           );
-          s.drawCameraFeed(
+
+          drawCameraFeed(
             ctx,
             cam4,
             cam4 ? `${cam4.id.split("_")[0]} (Cam 4)` : "Camera 4 (Offline)",
@@ -1689,14 +1885,16 @@ export default function Studio() {
             w,
             h,
           );
+
           ctx.fillStyle = "#1E293B";
           ctx.fillRect(w - 1, 0, 2, canvas.height);
           ctx.fillRect(0, h - 1, canvas.width, 2);
-        } else if (s.activeLayout === "wide-cu") {
-          const mainW = canvas.width * 0.75,
-            sideW = canvas.width * 0.25,
-            sideH = canvas.height / 2;
-          s.drawCameraFeed(
+        } else if (activeLayout === "wide-cu") {
+          const mainW = canvas.width * 0.75;
+          const sideW = canvas.width * 0.25;
+          const sideH = canvas.height / 2;
+
+          drawCameraFeed(
             ctx,
             cam1,
             cam1 ? `${cam1.id.split("_")[0]} (Wide)` : "Camera 1 (Offline)",
@@ -1705,7 +1903,8 @@ export default function Studio() {
             mainW,
             canvas.height,
           );
-          s.drawCameraFeed(
+
+          drawCameraFeed(
             ctx,
             cam2,
             cam2 ? `${cam2.id.split("_")[0]} (CU 1)` : "Camera 2 (Offline)",
@@ -1714,7 +1913,8 @@ export default function Studio() {
             sideW,
             sideH,
           );
-          s.drawCameraFeed(
+
+          drawCameraFeed(
             ctx,
             cam3,
             cam3 ? `${cam3.id.split("_")[0]} (CU 2)` : "Camera 3 (Offline)",
@@ -1723,6 +1923,7 @@ export default function Studio() {
             sideW,
             sideH,
           );
+
           ctx.fillStyle = "#1E293B";
           ctx.fillRect(mainW - 1, 0, 2, canvas.height);
           ctx.fillRect(mainW, sideH - 1, sideW, 2);
@@ -1738,45 +1939,30 @@ export default function Studio() {
         );
       }
 
-      // Draw overlays
-      s.overlays.forEach((overlay) => {
-        if (s.activeOverlays[overlay.id]) s.renderOverlay(ctx, overlay);
+      overlays.forEach((overlay) => {
+        if (activeOverlays[overlay.id]) {
+          renderOverlay(ctx, overlay);
+        }
       });
 
-      // Draw LIVE indicator
-      if (s.isLive) {
+      if (isLive) {
         ctx.fillStyle = "rgba(239, 68, 68, 0.9)";
         ctx.fillRect(16, 16, 70, 28);
         ctx.fillStyle = "#fff";
         ctx.font = "bold 12px 'DM Sans', sans-serif";
+        ctx.textAlign = "center";
         ctx.fillText("● LIVE", 51, 35);
       }
     };
 
-    // Start Web Worker timer
-    const worker = new Worker(
-      new URL("../workers/timerWorker.js", import.meta.url),
-      { type: "module" },
-    );
-    timerWorkerRef.current = worker;
-    worker.onmessage = () => render();
-    worker.postMessage("start");
-
-    // Also update the stateRef when state changes (so the worker tick uses fresh values)
-    stateRef.cameras = cameras;
-    stateRef.activeCameraId = activeCameraId;
-    stateRef.activeLayout = activeLayout;
-    stateRef.overlays = overlays;
-    stateRef.activeOverlays = activeOverlays;
-    stateRef.isLive = isLive;
-    stateRef.getResolvedSlots = getResolvedSlots;
-    stateRef.drawCameraFeed = drawCameraFeed;
-    stateRef.renderOverlay = renderOverlay;
+    animationId = requestAnimationFrame(render);
+    frameRequestRef.current = animationId;
 
     return () => {
-      worker.postMessage("stop");
-      worker.terminate();
-      timerWorkerRef.current = null;
+      if (animationId) cancelAnimationFrame(animationId);
+      if (frameRequestRef.current)
+        cancelAnimationFrame(frameRequestRef.current);
+      frameRequestRef.current = null;
     };
   }, [
     cameras,
@@ -1785,12 +1971,10 @@ export default function Studio() {
     overlays,
     activeOverlays,
     isLive,
-    drawVideoFit,
     drawCameraFeed,
     getResolvedSlots,
     renderOverlay,
   ]);
-
   // Go Live
   const goLive = async () => {
     if (!eventData) return;
@@ -3303,8 +3487,8 @@ export default function Studio() {
               <div className="vc-canvas-frame">
                 <canvas
                   ref={canvasRef}
-                  width={1920}
-                  height={1080}
+                  width={STREAM_WIDTH}
+                  height={STREAM_HEIGHT}
                   style={{ aspectRatio: "16/9" }}
                 />
               </div>
@@ -3316,7 +3500,7 @@ export default function Studio() {
                   start RTMP destinations.
                 </span>
                 <span className="font-mono text-zinc-500">
-                  1920×1080 / 16:9
+                  1920×720 / 24fps
                 </span>
               </div>
             </section>

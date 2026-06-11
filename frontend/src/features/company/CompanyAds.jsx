@@ -15,6 +15,12 @@ function statusTone(status) {
   return "warning";
 }
 
+function aiTone(status) {
+  if (status === "approved") return "success";
+  if (status === "rejected") return "danger";
+  return "warning";
+}
+
 export default function CompanyAds() {
   const [ads, setAds] = useState([]);
 
@@ -32,8 +38,8 @@ export default function CompanyAds() {
         acc.spent += Number(ad.spentAmount ?? 0);
         acc.remaining += Number(ad.remainingBudget ?? 0);
         acc.platformViews += Number(ad.platformViews ?? 0);
-        acc.youtubeViews += Number(ad.youtubeViews ?? 0);
-        acc.facebookViews += Number(ad.facebookViews ?? 0);
+        acc.aiApproved += ad.aiModerationStatus === "approved" ? 1 : 0;
+        acc.aiFlagged += ad.aiModerationStatus === "pending" ? 1 : 0;
         return acc;
       },
       {
@@ -41,8 +47,8 @@ export default function CompanyAds() {
         spent: 0,
         remaining: 0,
         platformViews: 0,
-        youtubeViews: 0,
-        facebookViews: 0,
+        aiApproved: 0,
+        aiFlagged: 0,
       },
     );
   }, [ads]);
@@ -50,7 +56,7 @@ export default function CompanyAds() {
   return (
     <DashboardLayout
       title="Company Ads"
-      subtitle="Track campaign budget, consumed spend, platform views, and external views."
+      subtitle="Track campaign budget, AI moderation, consumed spend, and platform views."
       actions={
         <Link className="btn btn-primary" to="/company/ads/create">
           <i className="fa-solid fa-plus" /> Create ad
@@ -66,24 +72,24 @@ export default function CompanyAds() {
         />
 
         <StatCard
-          icon="fa-solid fa-money-bill-wave"
-          label="Consumed spend"
-          value={money(totals.spent)}
-          note="Billable platform views"
+          icon="fa-solid fa-robot"
+          label="AI approved"
+          value={totals.aiApproved}
+          note="Auto-approved ads"
+        />
+
+        <StatCard
+          icon="fa-solid fa-triangle-exclamation"
+          label="Needs review"
+          value={totals.aiFlagged}
+          note="Flagged by AI"
         />
 
         <StatCard
           icon="fa-solid fa-eye"
           label="Platform views"
           value={totals.platformViews}
-          note="Vision Cast verified views"
-        />
-
-        <StatCard
-          icon="fa-brands fa-youtube"
-          label="External views"
-          value={totals.youtubeViews + totals.facebookViews}
-          note="Report-only for now"
+          note="Verified Vision Cast views"
         />
       </div>
 
@@ -100,13 +106,12 @@ export default function CompanyAds() {
                 <tr>
                   <th>Ad</th>
                   <th>Status</th>
+                  <th>AI moderation</th>
+                  <th>Risk</th>
                   <th>Budget</th>
                   <th>Spent</th>
                   <th>Remaining</th>
                   <th>Platform views</th>
-                  <th>YouTube</th>
-                  <th>Facebook</th>
-                  <th>Plays</th>
                   <th>CPV</th>
                   <th>Created</th>
                 </tr>
@@ -127,15 +132,20 @@ export default function CompanyAds() {
                       <Badge tone={statusTone(ad.status)}>{ad.status}</Badge>
                     </td>
 
+                    <td>
+                      <Badge tone={aiTone(ad.aiModerationStatus)}>
+                        {ad.aiModerationStatus || "pending"}
+                      </Badge>
+                      <small>
+                        {ad.aiModerationReason || "AI check completed"}
+                      </small>
+                    </td>
+
+                    <td>{Number(ad.aiRiskScore || 0).toFixed(0)}%</td>
                     <td>{money(ad.campaignBudget ?? ad.chargeAmount)}</td>
                     <td>{money(ad.spentAmount)}</td>
                     <td>{money(ad.remainingBudget)}</td>
                     <td>{ad.platformViews || 0}</td>
-                    <td>{ad.youtubeViews || 0}</td>
-                    <td>{ad.facebookViews || 0}</td>
-                    <td>
-                      {ad.completedPlays || 0}/{ad.maxPlays || "∞"}
-                    </td>
                     <td>{money(ad.costPerView ?? ad.baseChargePerPlay)}</td>
                     <td>
                       <small>{dateTime(ad.createdAt)}</small>

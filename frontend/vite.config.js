@@ -4,9 +4,15 @@ import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+
   server: {
+    host: '0.0.0.0',
     port: 5173,
-    host: true,
+
+    allowedHosts: [
+      '37be-124-41-204-75.ngrok-free.app'
+    ],
+
     proxy: {
       '/api': {
         target: 'http://localhost:8080',

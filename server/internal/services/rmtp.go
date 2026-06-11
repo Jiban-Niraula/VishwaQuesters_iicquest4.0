@@ -52,38 +52,38 @@ func (r *RTMPStreamer) StartStream(destinationID uint, serverURL, streamKey stri
 
 	args := []string{
 		"-hide_banner",
-		"-loglevel", "info",
+		"-loglevel", "warning",
 
-		// Browser MediaRecorder sends WebM chunks through stdin.
-		// Do not use tiny probe values here. FFmpeg needs enough data
-		// to detect VP8/VP9 + Opus correctly.
+		// Browser MediaRecorder WebM chunks from stdin.
 		"-fflags", "+genpts",
-		"-use_wallclock_as_timestamps", "1",
-		"-thread_queue_size", "1024",
-		"-probesize", "100M",
-		"-analyzeduration", "100M",
+		"-thread_queue_size", "2048",
+		"-probesize", "50M",
+		"-analyzeduration", "50M",
 		"-f", "webm",
 		"-i", "pipe:0",
 
-		// Video output for YouTube/Facebook/Twitch RTMP.
-		"-vf", "fps=30,format=yuv420p",
+		// Stable 720p output for hackathon demo.
+		"-vf", "scale=1280:720:flags=fast_bilinear,fps=24,format=yuv420p",
 		"-c:v", "libx264",
-		"-preset", "veryfast",
+		"-preset", "ultrafast",
 		"-tune", "zerolatency",
-		"-b:v", "4500k",
-		"-maxrate", "4500k",
-		"-bufsize", "9000k",
-		"-g", "60",
-		"-keyint_min", "60",
+		"-profile:v", "baseline",
+		"-level", "3.1",
+		"-b:v", "2500k",
+		"-maxrate", "2500k",
+		"-bufsize", "5000k",
+		"-g", "48",
+		"-keyint_min", "48",
 		"-sc_threshold", "0",
+		"-bf", "0",
 
-		// Audio output.
+		// Audio.
 		"-c:a", "aac",
-		"-b:a", "160k",
+		"-b:a", "128k",
 		"-ar", "48000",
 		"-ac", "2",
 
-		// RTMP/FLV output.
+		// RTMP output.
 		"-f", "flv",
 		"-flvflags", "no_duration_filesize",
 		"-rtmp_live", "live",
