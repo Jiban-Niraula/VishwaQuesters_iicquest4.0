@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import useWebSocket from "../hooks/useWebSocket";
 import PublicLayout from "../shared/layout/PublicLayout.jsx";
+import { useOrientation } from "../lib/useOrientation.js";
 
 const CAMERA_TYPES = [
 	{
@@ -63,6 +64,15 @@ const ICE_SERVERS = buildIceServers();
 console.log("ICE_SERVERS:", ICE_SERVERS);
 
 export default function Camera() {
+	const orientation = useOrientation();
+	const systemIsLandscape = orientation?.type?.includes("landscape") || [90, -90, 270].includes(orientation?.angle);
+	const [manualLayout, setManualLayout] = useState(null);
+	const isLandscape = manualLayout !== null ? manualLayout === "landscape" : systemIsLandscape;
+	
+	const toggleLayout = () => {
+		setManualLayout(isLandscape ? "portrait" : "landscape");
+	};
+
 	const [searchParams] = useSearchParams();
 	const navigate = useNavigate();
 
@@ -602,7 +612,7 @@ export default function Camera() {
 
 	return (
 		<PublicLayout>
-			<div className="vc-camera-live">
+			<div className={`vc-camera-live ${isLandscape ? "landscape" : "portrait"}`}>
 				<div className="vc-camera-status-bar">
 					<div className="vc-camera-status-left">
 						<span
@@ -687,6 +697,15 @@ export default function Camera() {
 						title="Switch camera">
 						<i className="fa-solid fa-rotate" />
 						<span>Flip</span>
+					</button>
+
+					<button
+						type="button"
+						className="vc-ctrl-btn"
+						onClick={toggleLayout}
+						title={isLandscape ? "Dock to Bottom" : "Dock to Side"}>
+						<i className={`fa-solid ${isLandscape ? "fa-arrow-down" : "fa-arrow-right"}`} />
+						<span>Dock</span>
 					</button>
 
 					<button

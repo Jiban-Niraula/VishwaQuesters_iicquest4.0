@@ -2330,6 +2330,39 @@ td strong {
   color: #ffffff;
 }
 
+/* Landscape Mode Adjustments */
+.vc-camera-live.landscape {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto 1fr auto;
+  grid-template-areas:
+    "status   controls"
+    "viewport controls"
+    "zoom     controls";
+}
+
+.vc-camera-live.landscape .vc-camera-status-bar {
+  grid-area: status;
+  border-bottom: 1px solid var(--line);
+}
+
+.vc-camera-live.landscape .vc-camera-viewport {
+  grid-area: viewport;
+}
+
+.vc-camera-live.landscape .vc-camera-zoom-bar {
+  grid-area: zoom;
+  border-top: 1px solid var(--line);
+}
+
+.vc-camera-live.landscape .vc-camera-controls {
+  grid-area: controls;
+  flex-direction: column;
+  border-top: none;
+  border-left: 1px solid var(--line);
+  padding: 24px 16px;
+}
+
 @media (max-width: 900px) {
   .vc-camera-join {
     flex-direction: column;
