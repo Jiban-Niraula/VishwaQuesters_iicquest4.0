@@ -238,34 +238,6 @@ export default function CompanyCreateAd() {
               <span>Estimated platform reach</span>
               <strong>{estimate.estimatedViews}</strong>
             </p>
-
-            <p>
-              <span>Admin commission model</span>
-              <strong>30%</strong>
-            </p>
-
-            <p>
-              <span>Creator pool model</span>
-              <strong>70%</strong>
-            </p>
-          </div>
-
-          <div className="rule-list" style={{ marginTop: 16 }}>
-            <p>
-              <i className="fa-solid fa-check" /> Platform views are billable.
-            </p>
-            <p>
-              <i className="fa-solid fa-check" /> YouTube/Facebook views are
-              report-only for now.
-            </p>
-            <p>
-              <i className="fa-solid fa-check" /> Admin commission is credited
-              after real consumed spend.
-            </p>
-            <p>
-              <i className="fa-solid fa-check" /> Creator payout depends on
-              Free/Pro plan.
-            </p>
           </div>
         </Card>
       </div>
