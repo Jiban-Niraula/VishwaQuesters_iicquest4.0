@@ -65,10 +65,13 @@ console.log("ICE_SERVERS:", ICE_SERVERS);
 
 export default function Camera() {
 	const orientation = useOrientation();
-	const systemIsLandscape = orientation?.type?.includes("landscape") || [90, -90, 270].includes(orientation?.angle);
+	const systemIsLandscape =
+		orientation?.type?.includes("landscape") ||
+		[90, -90, 270].includes(orientation?.angle);
 	const [manualLayout, setManualLayout] = useState(null);
-	const isLandscape = manualLayout !== null ? manualLayout === "landscape" : systemIsLandscape;
-	
+	const isLandscape =
+		manualLayout !== null ? manualLayout === "landscape" : systemIsLandscape;
+
 	const toggleLayout = () => {
 		setManualLayout(isLandscape ? "portrait" : "landscape");
 	};
@@ -612,7 +615,8 @@ export default function Camera() {
 
 	return (
 		<PublicLayout>
-			<div className={`vc-camera-live ${isLandscape ? "landscape" : "portrait"}`}>
+			<div
+				className={`vc-camera-live ${isLandscape ? "landscape" : "portrait"}`}>
 				<div className="vc-camera-status-bar">
 					<div className="vc-camera-status-left">
 						<span
@@ -704,7 +708,9 @@ export default function Camera() {
 						className="vc-ctrl-btn"
 						onClick={toggleLayout}
 						title={isLandscape ? "Dock to Bottom" : "Dock to Side"}>
-						<i className={`fa-solid ${isLandscape ? "fa-arrow-down" : "fa-arrow-right"}`} />
+						<i
+							className={`fa-solid ${isLandscape ? "fa-arrow-down" : "fa-arrow-right"}`}
+						/>
 						<span>Dock</span>
 					</button>
 

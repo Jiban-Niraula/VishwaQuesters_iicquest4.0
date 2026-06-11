@@ -97,7 +97,7 @@ export default function DashboardLayout({
 						<div className="w-64 bg-[#0c0c0d] h-full flex flex-col p-6 border-r border-white/10">
 							<div className="flex justify-between items-center mb-8 text-white font-extrabold text-lg">
 								<div className="flex items-center gap-3">
-									<i className="fa-solid fa-video text-[var(--primary-2)]" />
+									<i className="fa-solid fa-video text-(--primary-2)" />
 									<span>{config.appName}</span>
 								</div>
 								<button
