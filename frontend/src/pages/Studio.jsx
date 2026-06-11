@@ -3660,6 +3660,7 @@ export default function Studio() {
 		toggleCommentaryMute,
 		changeLayout,
 		handleCreateOverlay,
+		updateOverlay,
 		toggleOverlayActive,
 		handleDeleteOverlay,
 		startScreenShare,
