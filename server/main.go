@@ -140,6 +140,11 @@ func main() {
 	r.GET("/ws/:code", webrtc.HandleWebSocket(db))
 	r.GET("/api/stream/ws", webrtc.HandleStreamWebSocket(db, rtmpService))
 
+	r.GET("/ping", func(ctx *gin.Context) {
+		ctx.JSON(200, gin.H{
+			"message": "I am alive",
+		})
+	})
 	port := config.Env("PORT", "8080")
 	log.Println("Server running on port", port)
 	log.Fatal(r.Run(":" + port))
