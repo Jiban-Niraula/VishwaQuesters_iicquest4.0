@@ -3854,10 +3854,11 @@ export default function Studio() {
             <div className="vc-panel-body flex-1 overflow-y-auto p-4">
               {/* Cameras Panel */}
               {activePanel === "cameras" && (
-                <div className="space-y-4">
+                <div className="space-y-3">
                   <h3 className="font-bold text-sm text-gray-400 uppercase">
                     Connected Cameras ({Object.keys(cameras).length})
                   </h3>
+
                   {/* Auto-Switch Controls */}
                   <div className="bg-gray-800 rounded-lg p-3 space-y-2">
                     <div className="flex items-center justify-between">
@@ -3907,52 +3908,118 @@ export default function Studio() {
                       </div>
                     )}
                   </div>
-                  {Object.values(cameras).map((cam) => (
-                    <div
-                      key={cam.id}
-                      className={`bg-gray-800 rounded-lg p-3 transition border-2 ${activeCameraId === cam.id ? "border-red-500" : "border-transparent hover:border-gray-600"}`}
-                    >
+
+                  {Object.values(cameras).length === 0 && (
+                    <div className="text-center py-6 text-gray-500">
+                      <i className="fa-solid fa-video-slash text-xl mb-2 block" />
+                      <p className="text-xs">No cameras connected yet</p>
+                    </div>
+                  )}
+
+                  {Object.values(cameras).map((cam) => {
+                    const isActive = activeCameraId === cam.id;
+                    const hasVideo =
+                      cam.stream && cam.stream.getVideoTracks().length > 0;
+                    const connState =
+                      peerConnectionsRef.current[cam.id]?.connectionState;
+
+                    return (
                       <div
-                        className="flex items-center justify-between cursor-pointer mb-2"
+                        key={cam.id}
                         onClick={() => setActiveCameraId(cam.id)}
+                        className={`bg-gray-800 rounded-lg overflow-hidden cursor-pointer transition border-2 ${
+                          isActive
+                            ? "border-red-500 shadow-lg shadow-red-500/20"
+                            : "border-transparent hover:border-gray-600"
+                        }`}
                       >
-                        <div className="flex items-center gap-2">
-                          <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                          <span className="text-sm font-medium">
-                            {cam.deviceName || cam.id.split("_")[0]}
-                          </span>
+                        {/* Row: Small Video + Camera Info */}
+                        <div className="flex items-center gap-3 p-2">
+                          {/* Small Live Video Thumbnail */}
+                          <div className="relative w-20 h-12 rounded-md overflow-hidden bg-black shrink-0">
+                            {hasVideo ? (
+                              <video
+                                autoPlay
+                                playsInline
+                                muted
+                                ref={(el) => {
+                                  if (el && cam.stream) {
+                                    el.srcObject = cam.stream;
+                                    if (el.paused) {
+                                      el.play().catch(() => {});
+                                    }
+                                  }
+                                }}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center">
+                                <i className="fa-solid fa-video-slash text-gray-600 text-xs" />
+                              </div>
+                            )}
+                            {/* LIVE dot on thumbnail */}
+                            {isActive && (
+                              <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+                            )}
+                          </div>
+
+                          {/* Camera Name + Status */}
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`w-2 h-2 rounded-full shrink-0 ${
+                                  connState === "connected"
+                                    ? "bg-green-500"
+                                    : connState === "connecting"
+                                      ? "bg-yellow-500 animate-pulse"
+                                      : "bg-red-500"
+                                }`}
+                              />
+                              <span className="text-sm font-medium truncate">
+                                {cam.deviceName || cam.id.split("_")[0]}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 mt-1">
+                              <span className="text-[10px] text-gray-500 uppercase">
+                                {cam.type}
+                              </span>
+                              {isActive && (
+                                <span className="text-[10px] bg-red-600 px-1.5 py-0.5 rounded font-bold">
+                                  ACTIVE
+                                </span>
+                              )}
+                            </div>
+                          </div>
                         </div>
-                        {activeCameraId === cam.id && (
-                          <span className="text-xs bg-red-600 px-2 py-0.5 rounded font-bold">
-                            ACTIVE
-                          </span>
+
+                        {/* Zoom Slider */}
+                        {cam.type !== "screen" && (
+                          <div className="px-2 pb-2 flex items-center gap-2">
+                            <span className="text-xs text-gray-400">Zoom</span>
+                            <input
+                              type="range"
+                              min="1"
+                              max="4"
+                              step="0.1"
+                              value={cameraZoom[cam.id] || 1}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) =>
+                                setCameraZoom((p) => ({
+                                  ...p,
+                                  [cam.id]: parseFloat(e.target.value),
+                                }))
+                              }
+                              className="flex-1 accent-red-500"
+                            />
+                            <span className="text-xs text-gray-400 w-6">
+                              {(cameraZoom[cam.id] || 1).toFixed(1)}x
+                            </span>
+                          </div>
                         )}
                       </div>
-                      {/* Zoom Slider */}
-                      {cam.type !== "screen" && (
-                        <div className="mt-2 flex items-center gap-2">
-                          <span className="text-xs text-gray-400">Zoom</span>
-                          <input
-                            type="range"
-                            min="1"
-                            max="4"
-                            step="0.1"
-                            value={cameraZoom[cam.id] || 1}
-                            onChange={(e) =>
-                              setCameraZoom((p) => ({
-                                ...p,
-                                [cam.id]: parseFloat(e.target.value),
-                              }))
-                            }
-                            className="flex-1 accent-red-500"
-                          />
-                          <span className="text-xs text-gray-400 w-6">
-                            {(cameraZoom[cam.id] || 1).toFixed(1)}x
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
+
                   <h3 className="font-bold text-sm text-gray-400 uppercase mt-6">
                     Layout
                   </h3>
