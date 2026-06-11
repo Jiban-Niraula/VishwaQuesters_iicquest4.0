@@ -231,8 +231,8 @@ Change the default admin password before using the project seriously.
 7. Admin approves the ad.
 8. Creator creates an event.
 9. Creator opens studio and starts streaming.
-10. Public viewers watch the event using the event code.
-11. Creator can play approved ads and receive wallet balance after completion.
+10.   Public viewers watch the event using the event code.
+11.   Creator can play approved ads and receive wallet balance after completion.
 
 ## Useful Routes
 

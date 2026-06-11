@@ -613,3 +613,4 @@ build/*
 
 zdeploy/*
 pnpm*
+host
