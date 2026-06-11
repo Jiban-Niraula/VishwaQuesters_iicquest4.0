@@ -159,6 +159,17 @@ export default function Studio() {
   const recordingDirHandleRef = useRef(null); // Directory handle from File System Access API
   const hlsInstancesRef = useRef({}); // hls.js instances keyed by overlay id
 
+  // Auto-switch refs
+  const autoSwitchEnabledRef = useRef(false);
+  const lastSwitchTimeRef = useRef(0);
+  const analyserNodesRef = useRef({}); // { [cameraId]: AnalyserNode }
+  const prevFrameDataRef = useRef({}); // { [cameraId]: Uint8ClampedArray }
+  const autoSwitchIntervalRef = useRef(null);
+
+  // State
+  const [autoSwitchEnabled, setAutoSwitchEnabled] = useState(false);
+  const [autoSwitchMode, setAutoSwitchMode] = useState("audio"); // "audio" | "motion" | "both"
+
   // State
   const [cameras, setCameras] = useState({});
   const [activeCameraId, setActiveCameraId] = useState(null);
@@ -327,6 +338,203 @@ export default function Studio() {
     },
     [drawVideoFit, cameraZoom],
   );
+
+  // ── Auto Camera Switching Engine ──────────────────────────────────
+
+  // Get audio level (0-1) for a camera using AnalyserNode
+  const getAudioLevel = useCallback((cameraId) => {
+    const analyser = analyserNodesRef.current[cameraId];
+    if (!analyser) return 0;
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(dataArray);
+
+    // Average of frequency bins, normalized to 0-1
+    let sum = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+      sum += dataArray[i];
+    }
+    return sum / (dataArray.length * 255);
+  }, []);
+
+  // Get motion score (0-1) for a camera by comparing current frame to previous
+  const getMotionScore = useCallback((cameraId, videoElement) => {
+    if (
+      !videoElement ||
+      videoElement.readyState < 2 ||
+      !videoElement.videoWidth
+    )
+      return 0;
+
+    const sampleSize = 40; // Downsample to 40x30 for speed
+    const sampleH = 30;
+
+    const tempCanvas = document.createElement("canvas");
+    tempCanvas.width = sampleSize;
+    tempCanvas.height = sampleH;
+    const ctx = tempCanvas.getContext("2d", { willReadFrequently: true });
+
+    ctx.drawImage(videoElement, 0, 0, sampleSize, sampleH);
+    const currentFrame = ctx.getImageData(0, 0, sampleSize, sampleH).data;
+
+    const prevFrame = prevFrameDataRef.current[cameraId];
+    prevFrameDataRef.current[cameraId] = currentFrame;
+
+    if (!prevFrame) return 0;
+
+    // Calculate pixel difference (only sample every 4th pixel for speed)
+    let diff = 0;
+    let count = 0;
+    for (let i = 0; i < currentFrame.length; i += 16) {
+      // Every 4th pixel (RGBA = 4 bytes, skip 4 pixels = 16 bytes)
+      const rDiff = Math.abs(currentFrame[i] - prevFrame[i]);
+      const gDiff = Math.abs(currentFrame[i + 1] - prevFrame[i + 1]);
+      const bDiff = Math.abs(currentFrame[i + 2] - prevFrame[i + 2]);
+      diff += (rDiff + gDiff + bDiff) / 3;
+      count++;
+    }
+
+    // Normalize: typical motion gives 5-30 per pixel difference, heavy motion 30-80
+    const avgDiff = count > 0 ? diff / count : 0;
+    return Math.min(avgDiff / 40, 1); // Scale so ~40 avg diff = score of 1.0
+  }, []);
+
+  // Wire up AnalyserNode for a camera's audio source
+  const setupAnalyserForCamera = useCallback((cameraId) => {
+    const audioSource = audioSourcesRef.current[cameraId];
+    if (!audioSource?.sourceNode || !audioContextRef.current) return;
+
+    // Don't recreate if already exists
+    if (analyserNodesRef.current[cameraId]) return;
+
+    const analyser = audioContextRef.current.createAnalyser();
+    analyser.fftSize = 256; // Small for speed (128 bins)
+    analyser.smoothingTimeConstant = 0.5;
+
+    // Connect: sourceNode → analyser (parallel to existing gainNode → destination)
+    audioSource.sourceNode.connect(analyser);
+    analyserNodesRef.current[cameraId] = analyser;
+
+    console.log(`📊 AnalyserNode set up for camera ${cameraId}`);
+  }, []);
+
+  // The main auto-switch decision loop
+  const runAutoSwitch = useCallback(() => {
+    if (!autoSwitchEnabledRef.current) return;
+
+    const now = Date.now();
+    const MIN_DWELL = 3000; // Stay on a camera for at least 3 seconds
+    const COOLDOWN = 2000; // 2s cooldown between switches
+
+    if (now - lastSwitchTimeRef.current < MIN_DWELL) return;
+
+    const cameraList = Object.values(cameras);
+    if (cameraList.length < 2) return; // Need at least 2 cameras
+
+    let bestCameraId = null;
+    let bestScore = -1;
+
+    cameraList.forEach((cam) => {
+      let score = 0;
+
+      // Audio-based scoring
+      if (autoSwitchMode === "audio" || autoSwitchMode === "both") {
+        // Ensure analyser is set up
+        if (!analyserNodesRef.current[cam.id]) {
+          setupAnalyserForCamera(cam.id);
+        }
+        const audioLevel = getAudioLevel(cam.id);
+        score += audioLevel * 0.7; // Audio gets 70% weight
+      }
+
+      // Motion-based scoring
+      if (autoSwitchMode === "motion" || autoSwitchMode === "both") {
+        const videoEl = cam.videoElement;
+        const motionScore = getMotionScore(cam.id, videoEl);
+
+        if (autoSwitchMode === "motion") {
+          score += motionScore;
+        } else {
+          score += motionScore * 0.3; // Motion gets 30% weight in "both" mode
+        }
+      }
+
+      // Small penalty for the currently active camera (avoid sticking)
+      if (cam.id === activeCameraId) {
+        score *= 0.85;
+      }
+
+      // Need a meaningful threshold to switch — don't switch for tiny differences
+      if (score > bestScore) {
+        bestScore = score;
+        bestCameraId = cam.id;
+      }
+    });
+
+    // Only switch if the best camera is different AND score is above threshold
+    const THRESHOLD = autoSwitchMode === "audio" ? 0.08 : 0.12;
+    if (
+      bestCameraId &&
+      bestCameraId !== activeCameraId &&
+      bestScore > THRESHOLD
+    ) {
+      console.log(
+        `🔄 Auto-switch: ${activeCameraId} → ${bestCameraId} (score: ${bestScore.toFixed(3)}, mode: ${autoSwitchMode})`,
+      );
+      setActiveCameraId(bestCameraId);
+      lastSwitchTimeRef.current = now;
+    }
+  }, [
+    cameras,
+    activeCameraId,
+    autoSwitchMode,
+    getAudioLevel,
+    getMotionScore,
+    setupAnalyserForCamera,
+  ]);
+
+  // Start/stop auto-switch
+  const toggleAutoSwitch = useCallback(() => {
+    const next = !autoSwitchEnabledRef.current;
+    autoSwitchEnabledRef.current = next;
+    setAutoSwitchEnabled(next);
+
+    if (next) {
+      // Set up analysers for all existing cameras
+      Object.keys(audioSourcesRef.current).forEach((camId) => {
+        setupAnalyserForCamera(camId);
+      });
+
+      // Run the check every 500ms (2 checks per second — very lightweight)
+      autoSwitchIntervalRef.current = setInterval(runAutoSwitch, 500);
+      lastSwitchTimeRef.current = Date.now();
+      console.log("🔄 Auto-switch ENABLED");
+    } else {
+      if (autoSwitchIntervalRef.current) {
+        clearInterval(autoSwitchIntervalRef.current);
+        autoSwitchIntervalRef.current = null;
+      }
+      console.log("🔄 Auto-switch DISABLED");
+    }
+  }, [runAutoSwitch, setupAnalyserForCamera]);
+
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      if (autoSwitchIntervalRef.current) {
+        clearInterval(autoSwitchIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Set up analysers when new cameras connect
+  useEffect(() => {
+    if (autoSwitchEnabledRef.current) {
+      Object.keys(audioSourcesRef.current).forEach((camId) => {
+        setupAnalyserForCamera(camId);
+      });
+    }
+  }, [cameras, autoSwitchEnabled, setupAnalyserForCamera]);
 
   // Helper to resolve camera slot assignments (respecting manual overrides and auto-filling unassigned slots)
   const getResolvedSlots = useCallback(() => {
@@ -3650,6 +3858,55 @@ export default function Studio() {
                   <h3 className="font-bold text-sm text-gray-400 uppercase">
                     Connected Cameras ({Object.keys(cameras).length})
                   </h3>
+                  {/* Auto-Switch Controls */}
+                  <div className="bg-gray-800 rounded-lg p-3 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <i className="fa-solid fa-wand-magic-sparkles text-purple-400 text-sm" />
+                        <span className="text-sm font-bold">Auto Switch</span>
+                      </div>
+                      <button
+                        onClick={toggleAutoSwitch}
+                        className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
+                          autoSwitchEnabled
+                            ? "bg-purple-600 text-white shadow-lg shadow-purple-600/30"
+                            : "bg-gray-700 text-gray-400 hover:bg-gray-600"
+                        }`}
+                      >
+                        {autoSwitchEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    {autoSwitchEnabled && (
+                      <div className="flex gap-1">
+                        {[
+                          {
+                            id: "audio",
+                            label: "Audio",
+                            icon: "fa-microphone",
+                          },
+                          {
+                            id: "motion",
+                            label: "Motion",
+                            icon: "fa-person-running",
+                          },
+                          { id: "both", label: "Both", icon: "fa-sliders" },
+                        ].map((mode) => (
+                          <button
+                            key={mode.id}
+                            onClick={() => setAutoSwitchMode(mode.id)}
+                            className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold transition-all flex flex-col items-center gap-1 ${
+                              autoSwitchMode === mode.id
+                                ? "bg-purple-600/30 text-purple-300 border border-purple-500/50"
+                                : "bg-gray-900 text-gray-500 border border-transparent hover:text-gray-300"
+                            }`}
+                          >
+                            <i className={`fa-solid ${mode.icon}`} />
+                            {mode.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                   {Object.values(cameras).map((cam) => (
                     <div
                       key={cam.id}
