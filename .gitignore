@@ -607,3 +607,5 @@ host/*
 
 go.mod
 go.sum
+
+plan.md
