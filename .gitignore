@@ -610,3 +610,6 @@ go.sum
 
 server
 build/*
+
+zdeploy/*
+pnpm*

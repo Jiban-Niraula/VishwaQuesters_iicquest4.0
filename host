@@ -1,5 +1,0 @@
-# for backend
-ssh -R 2407:localhost:5934 script@dovps
-
-# for frontend 
-ssh -R 2059:localhost:5033 script@dovps
